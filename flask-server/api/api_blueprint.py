@@ -211,9 +211,9 @@ def get_mesh_manifest(case_id):
 
     return jsonify(manifest)
 
-@api_blueprint.route("/cases/<case_id>/meshes/<filename>")
-def get_mesh_file(case_id, filename):
-    mesh_path = os.path.join(Constants.MESH_PATH, case_id, filename)
+@api_blueprint.route("/cases/<display_id>/meshes/<filename>")
+def get_mesh_file(display_id, filename):
+    mesh_path = os.path.join(Constants.MESH_PATH, display_id, filename)
     try:
         response = send_file(
             mesh_path,
@@ -349,18 +349,6 @@ def get_main_nifti(clabel_id):
     else:
         print(f"Could not find filepath: {main_nifti_path}. ")
         return jsonify({"error": "Could not find filepath"}), 404
-        
-        # npz_path = main_nifti_path.replace(".nii.gz", ".npz")
-        # if not os.path.exists(npz_path):   
-        #     return jsonify({"error": "Could not find npz filepath"}), 404
-        # npz_processor = NpzProcessor()
-        # npz_processor.npz_to_nifti(int(clabel_id), combined_label=False, save=True)  
-        
-        # response = make_response(send_file(main_nifti_path, mimetype='application/gzip'))
-
-        # response.headers['Cross-Origin-Resource-Policy'] = 'same-origin'
-        # response.headers['Cross-Origin-Embedder-Policy'] = 'require-corp'
-        # response.headers['Content-Encoding'] = 'gzip'
 
     return response
 
@@ -477,44 +465,30 @@ async def get_segmentations(combined_labels_id):
             response.headers['Cache-Control'] = 'public, max-age=604800, immutable'
             return response
 
-    if not os.path.exists(nifti_path):
-        await store_files(combined_labels_id)
-        niftiProcessor = NpzProcessor()
-        niftiProcessor.nifti_combine_labels(int(combined_labels_id))
-        # print(f"Could not find filepath: {nifti_path}. Creating a new one")
-        # npz_path = nifti_path.replace(".nii.gz", ".npz")
-        # npz_processor = NpzProcessor()
-        # if not os.path.exists(npz_path):   
-        #     print(f"Could not find npz filepath: {npz_path}. Creating a new one")
-
-        #     # ! pancrea instead of pancreas to include pancreatic labels
-        #     npz_processor.combine_labels(combined_labels_id, keywords={"pancrea": "pancreas"}, save=True)
-            
-        # npz_processor.npz_to_nifti(int(combined_labels_id), combined_label=True, save=True)   
-
     img = nib.load(nifti_path)
     data = img.get_fdata()
     if img.get_data_dtype() != np.uint8:
-        print("⚠️ Detected float label map, converting to uint8 for Niivue compatibility...")
+        print("⚠️ Detected float label map, converting to uint8 for Cornerstone compatibility...")
 
     try:
         img = nib.load(nifti_path)
-        data = img.get_fdata()
 
         if img.get_data_dtype() != np.uint8:
-            
-            data_uint8 = data.astype(np.uint8)
-            new_img = nib.Nifti1Image(data_uint8, img.affine, header=img.header)
+            raw = np.asanyarray(img.dataobj)
+
+            rounded = np.rint(raw)
+            data = rounded.astype(np.uint8)
+            data = data.astype(np.uint8)
+
+            new_img = nib.Nifti1Image(data, img.affine, header=img.header)
             new_img.set_data_dtype(np.uint8)
 
-            converted_path = nifti_path#.replace(".nii.gz", "_uint8.nii.gz")
-
-            if not os.path.exists(converted_path):
-                nib.save(new_img, converted_path)
-        else:
             converted_path = nifti_path
+            nib.save(new_img, converted_path)
+        # else:
+        #     converted_path = nifti_path
 
-        response = make_response(send_file(converted_path, mimetype='application/gzip'))
+        response = make_response(send_file(nifti_path, mimetype='application/gzip'))
         response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
         response.headers['Content-Encoding'] = 'gzip'
         response.headers['Cache-Control'] = 'public, max-age=604800, immutable'

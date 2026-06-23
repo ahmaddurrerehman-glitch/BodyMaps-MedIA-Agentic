@@ -100,7 +100,34 @@ def compute_global_center(data: np.ndarray, affine: np.ndarray) -> np.ndarray:
     three = nifti_world_to_three(world)
 
     return (three.min(axis=0) + three.max(axis=0)) / 2.0
+def compute_volume_bounds_three(shape, affine: np.ndarray):
+    nx, ny, nz = shape[:3]
 
+    corners_ijk = np.array(
+        [
+            [0, 0, 0],
+            [0, 0, nz - 1],
+            [0, ny - 1, 0],
+            [0, ny - 1, nz - 1],
+            [nx - 1, 0, 0],
+            [nx - 1, 0, nz - 1],
+            [nx - 1, ny - 1, 0],
+            [nx - 1, ny - 1, nz - 1],
+        ],
+        dtype=float,
+    )
+
+    world = nib.affines.apply_affine(affine, corners_ijk)
+    three = nifti_world_to_three(world)
+
+    center = (three.min(axis=0) + three.max(axis=0)) / 2.0
+
+    three_centered = three - center
+
+    return {
+        "min": three_centered.min(axis=0).tolist(),
+        "max": three_centered.max(axis=0).tolist(),
+    }
 
 def export_organ_mesh(
     data: np.ndarray,
@@ -156,11 +183,12 @@ def export_organ_mesh(
     }
 
 
-def preprocess_case(case_id: str, label_nifti_path: str, output_root: str):
+# display_id: PanTS_00000900
+def preprocess_case(display_id: str, label_nifti_path: str, output_root: str):
     label_nifti_path = Path(label_nifti_path)
     output_root = Path(output_root)
 
-    case_dir = output_root / case_id
+    case_dir = output_root
     case_dir.mkdir(parents=True, exist_ok=True)
 
     img = nib.load(str(label_nifti_path))
@@ -174,11 +202,14 @@ def preprocess_case(case_id: str, label_nifti_path: str, output_root: str):
     data = data.astype(np.int32)
 
     global_center = compute_global_center(data, img.affine)
+    bounds = compute_volume_bounds_three(data.shape, img.affine)
 
     manifest = {
-        "caseId": case_id,
+        "caseId": display_id,
         "center": global_center.tolist(),
         "organs": [],
+        "bounds": bounds,
+        "affine": img.affine.tolist(),
     }
 
     for label_id, meta in LABELS.items():
@@ -202,7 +233,7 @@ def preprocess_case(case_id: str, label_nifti_path: str, output_root: str):
                 "id": label_id,
                 "key": meta["key"],
                 "name": meta["name"],
-                "url": f"{os.getenv('API_ORIGIN', 'http://localhost:5001')}/api/cases/{case_id}/meshes/{out_name}",
+                "url": f"{os.getenv('API_ORIGIN', 'http://localhost:5001')}/api/cases/{display_id}/meshes/{out_name}",
                 "vertices": stats["vertices"],
                 "faces": stats["faces"],
             }
@@ -215,15 +246,22 @@ def preprocess_case(case_id: str, label_nifti_path: str, output_root: str):
 
     print(f"Wrote manifest -> {manifest_path}")
 
+def get_panTS_id(index):
+    cur_case_id = str(index)
+    iter = max(0, 8 - len(str(index)))
+    for _ in range(iter):
+        cur_case_id = "0" + cur_case_id
+    cur_case_id = "PanTS_" + cur_case_id    
+    return cur_case_id
 
 if __name__ == "__main__":
     combined_labels_id = 900
-    pants_case = "PanTS_00000900"
+    pants_case = get_panTS_id(combined_labels_id)
     subfolder = "LabelTr" if int(combined_labels_id) < 9000 else "LabelTe" 
     nifti_path = f"{Constants.PANTS_PATH}/data/{subfolder}/{pants_case}/{Constants.COMBINED_LABELS_NIFTI_FILENAME}"
     output_path = f"{Constants.PANTS_PATH}/data/meshes/{pants_case}/"
     preprocess_case(
-        case_id="PanTS_00000900",
+        display_id=pants_case,
         label_nifti_path=nifti_path,
         output_root=output_path,
     )

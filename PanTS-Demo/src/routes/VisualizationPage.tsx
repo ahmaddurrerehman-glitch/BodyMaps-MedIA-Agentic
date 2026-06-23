@@ -10,6 +10,7 @@ import {
 import React, { lazy, Suspense, useEffect, useRef, useState, type MouseEvent } from "react";
 import { useParams } from "react-router-dom";
 import ErrorBoundary from "../components/ErrorBoundary";
+import { SegmentationMeshViewer } from "../components/MeshViewer";
 import OpacitySlider from "../components/OpacitySlider/OpacitySlider";
 import OrganCheckbox from "../components/OrganCheckbox";
 import ReportScreen from "../components/ReportScreen/ReportScreen";
@@ -21,10 +22,10 @@ import {
     renderVisualization,
     setToolGroupOpacity,
     setVisibilities,
+    subscribeToCrosshairChanges,
     subscribeToVolumeProgress,
     toggleCrosshairTool
 } from "../helpers/CornerstoneNifti2";
-import { updateVisibilities } from "../helpers/NiiVueNifti";
 import {
     API_BASE,
     APP_CONSTANTS,
@@ -61,7 +62,7 @@ function VisualizationPage() {
 	// for big full-body scans than streaming the .nii.gz from HuggingFace). We probe
 	// the local file and only fall back to the public HuggingFace mirror when it isn't
 	// present (e.g. a dev checkout without the image data), so the viewer never breaks.
-	const displayId = pantsCase ?? sessionId ?? "1";
+	const caseId = pantsCase ?? sessionId ?? "1";
 	const [ctUrl, setCtUrl] = useState<string | null>(null);
 	const [segUrl, setSegUrl] = useState<string | null>(null);
 	// Whether the local volumes exist (enables the HD toggle). Dataset cases default to
@@ -148,6 +149,7 @@ function VisualizationPage() {
 	const [showTaskDetails, setShowTaskDetails] = useState(true);
 	const [showOrganDetails, setShowOrganDetails] = useState(false);
 	const [loading, setLoading] = useState(true);
+	const [crosshairMm, setCrosshairMm] = useState<[number, number, number] | null>(null);
 	const [labelColorMap, _setLabelColorMap] = useState<{ [key: number]: Color }>(
 		segmentation_category_colors
 	);
@@ -169,6 +171,18 @@ function VisualizationPage() {
 	useEffect(() => {
 		toggleCrosshairTool(crosshairToolActive);
 	}, [crosshairToolActive]);
+
+	useEffect(() => {
+		const unsubscribe = subscribeToCrosshairChanges((mm) => {
+            setCrosshairMm([
+                mm[0],
+                mm[1],
+                mm[2],
+            ]);
+        });
+
+        return unsubscribe;
+	}, [])
 
 	// Track the CT download to show an accurate ETA while the case loads. We follow the
 	// largest-total stream (the CT volume, not the smaller segmentation) and derive the
@@ -235,7 +249,7 @@ function VisualizationPage() {
 				cmap.length === 0
 			)
 				{
-					console.log("return", cmap.length);
+					console.log("return", ctUrl, segUrl);
 					return;
 				}
 
@@ -250,7 +264,6 @@ function VisualizationPage() {
 			);
 
 			setLoading(false);
-			if (!result) return;
 			const {
 				renderingEngine,
 				viewportIds,
@@ -276,6 +289,7 @@ function VisualizationPage() {
 		};
 
 		setup();
+
 	}, [
 		ctUrl,
 		segUrl,
@@ -400,7 +414,7 @@ function VisualizationPage() {
 
 	// Update segmentation visibility when state changes
 	useEffect(() => {
-		if (checkState && NV) {
+		if (checkState) {
 			const checkStateArr = [
 				true, // ID=0 background 永远可见
 				...checkBoxData.map((item) => !!checkState[item.id]),
@@ -412,13 +426,12 @@ function VisualizationPage() {
 			// 	create3DVolumeFew(render_ref, labelColorMap, getPanTSId(pantsCase ?? "1"), visible);
 			// }
 			// else {
-			updateVisibilities(NV, checkStateArr, sessionKey, cmapRef.current);
+			// updateVisibilities(NV, checkStateArr, sessionKey, cmapRef.current);
 			// }
 			setVisibilities(checkStateArr);
 		}
 	}, [
 		checkState,
-		NV,
 		checkBoxData,
 		sessionKey,
 	]);
@@ -446,7 +459,7 @@ function VisualizationPage() {
 		setStatsError(false);
 		try {
 			const fd = new FormData();
-			fd.append("sessionKey", String(displayId));
+			fd.append("sessionKey", String(caseId));
 			const res = await fetch(`${API_BASE}/api/mask-data`, { method: "POST", body: fd });
 			const data = await res.json();
 			// The endpoint returns its errors with HTTP 200 + an `error` field, so check both.
@@ -477,7 +490,7 @@ function VisualizationPage() {
 
 		const link = document.createElement("a");
 		link.href = url;
-		link.download = `${displayId}_segmentations.zip`;
+		link.download = `${caseId}_segmentations.zip`;
 		document.body.appendChild(link);
 		link.click();
 		document.body.removeChild(link);
@@ -567,7 +580,7 @@ function VisualizationPage() {
 									{zoomMode ? null : (
 										<div className="flex flex-col gap-1 items-start text-left px-1">
 											<span className="vp-case-eyebrow">{sessionId ? "Session" : "Case"}</span>
-											<span className="vp-case-id">{displayId}</span>
+											<span className="vp-case-id">{caseId}</span>
 										</div>
 									)}
 
@@ -747,7 +760,7 @@ function VisualizationPage() {
 								<div className="vp-loading">
 									<div className="flex flex-col items-center gap-4">
 										<div className="vp-spinner" />
-										<div className="vp-loading__text">Preparing case {displayId}…</div>
+										<div className="vp-loading__text">Preparing case {caseId}…</div>
 									</div>
 								</div>
 							}
@@ -801,21 +814,7 @@ function VisualizationPage() {
 
 					<div className={`render ${loading ? "" : "vp-pane vp-pane--render"}`} data-label="3D" style={panelStyle("3d")}>
 						<div className="canvas">
-							<canvas
-								ref={render_ref}
-							// width={800} 
-							// height={800} 
-							// style={{ width: "100%", height: "100%" }}
-							>
-							</canvas>
-							{tooltip.visible && (
-								<div
-									className="vp-organ-tip"
-									style={{ top: tooltip.y, left: tooltip.x }}
-								>
-									{tooltip.text}
-								</div>
-							)}
+							<SegmentationMeshViewer caseId={caseId} crosshairMm={crosshairMm} checkState={checkState} loading={loading} opacity={opacityValue} />
 						</div>
 					</div>
 				</div>
@@ -883,7 +882,7 @@ function VisualizationPage() {
 			{
 				showReportScreen && (
 					<ReportScreen
-						id={displayId}
+						id={caseId}
 						onClose={() => setShowReportScreen(false)}
 					/>
 				)
