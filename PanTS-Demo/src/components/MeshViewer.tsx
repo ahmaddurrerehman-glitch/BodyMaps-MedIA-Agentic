@@ -2,14 +2,17 @@ import { Bounds, OrbitControls } from "@react-three/drei";
 import { Canvas } from "@react-three/fiber";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { APP_CONSTANTS } from "../helpers/constants";
+import { cornerstoneLpsMmToThree, type Vec3 } from "../helpers/utils";
 import type { MeshManifest } from "../types";
 import { OrganMesh } from "./OrganMesh";
+import { SceneCrosshair3D } from "./SceneCrosshair3D";
 
 type SegmentationMeshViewerProps = {
   caseId: string;
   loading: boolean
   checkState: boolean[];
   opacity: number;
+  crosshairMm: Vec3 | null
 };
 
 
@@ -23,9 +26,18 @@ export async function fetchMeshManifest(caseId: string): Promise<MeshManifest> {
   return res.json();
 }
 
-export function SegmentationMeshViewer({ caseId, checkState, loading, opacity }: SegmentationMeshViewerProps) {
+export function SegmentationMeshViewer({ caseId, checkState, loading, opacity, crosshairMm }: SegmentationMeshViewerProps) {
   const [manifest, setManifest] = useState<MeshManifest | null>(null);
   const [loaded, setLoaded] = useState<Record<number, boolean>>({});
+
+  const crosshairPosition = useMemo(() => {
+    if (!manifest || !crosshairMm) return null;
+
+    return cornerstoneLpsMmToThree(
+      crosshairMm,
+      manifest.center
+    );
+  }, [manifest, crosshairMm]);
 
   useEffect(() => {
     let alive = true;
@@ -91,6 +103,12 @@ export function SegmentationMeshViewer({ caseId, checkState, loading, opacity }:
                 })}
               </group>
             </Bounds>
+              {crosshairPosition && (
+                <SceneCrosshair3D
+                  position={crosshairPosition}
+                  bounds={manifest.bounds}
+                />
+              )}
           </Suspense>
 
           <OrbitControls makeDefault />

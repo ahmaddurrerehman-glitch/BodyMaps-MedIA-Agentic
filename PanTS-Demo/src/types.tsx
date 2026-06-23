@@ -1,6 +1,7 @@
 import type { RenderingEngine } from "@cornerstonejs/core";
 import type { IImageVolume } from "@cornerstonejs/core/types";
 import type { SetStateAction } from "react";
+import type { Vec3 } from "./helpers/utils";
 
 export type metadataType = {
 	"PanTS ID": string;
@@ -135,8 +136,12 @@ export type OrganMeshInfo = {
 
 export type MeshManifest = {
   caseId: string;
-  center: number[];
+  center: Vec3;
   organs: OrganMeshInfo[];
+  bounds: {
+        min: Vec3;
+        max: Vec3;
+	};
 };
 
 export type LabelRequest = {
