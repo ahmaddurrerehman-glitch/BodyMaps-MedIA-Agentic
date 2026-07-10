@@ -1,5 +1,5 @@
 import { cache, init as coreInit, Enums, eventTarget, getRenderingEngine, imageLoader, metaData, RenderingEngine, setVolumesForViewports, utilities as csCoreUtils, volumeLoader } from "@cornerstonejs/core";
-import type { ColorLUT } from "@cornerstonejs/core/types";
+import type { ColorLUT, Point2, Point3 } from "@cornerstonejs/core/types";
 import { cornerstoneNiftiImageLoader, createNiftiImageIdsAndCacheMetadata, init as niftiImageLoaderInit } from "@cornerstonejs/nifti-volume-loader";
 import * as cornerstoneTools from '@cornerstonejs/tools';
 import { init as cornerstoneToolsInit } from '@cornerstonejs/tools';
@@ -1301,6 +1301,46 @@ export function getOrganLabelOnClick() {
     // })
     const idx = volume.voxelManager.getAtIJK(indices[0], indices[1], indices[2]);
     return idx;
+}
+
+// Hover variant of getOrganLabelOnClick: resolves the segment label under an arbitrary
+// screen point in one pane, via canvasToWorld → worldToIndex on that pane's own volume
+// geometry. Unlike the click path, this never touches the crosshair (no repositioning
+// side effect), which is what makes it safe to call on every mousemove for the
+// "hover to identify" tool.
+export function getOrganLabelAtPoint(pane: CinePane, clientX: number, clientY: number): number | undefined {
+    const engine = getRenderingEngine(renderingEngineId);
+    if (!engine) return undefined;
+    const viewport = engine.getViewport(CINE_VIEWPORT_BY_PANE[pane]) as unknown as
+        | { getCanvas(): HTMLCanvasElement; canvasToWorld(canvasPos: Point2): Point3 }
+        | undefined;
+    if (!viewport) return undefined;
+    const volume = cache.getVolume(segmentationId);
+    if (!volume || !volume.voxelManager || !volume.imageData) return undefined;
+
+    let canvas: HTMLCanvasElement;
+    try {
+        canvas = viewport.getCanvas();
+    } catch {
+        return undefined;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const canvasPos: Point2 = [clientX - rect.left, clientY - rect.top];
+    if (canvasPos[0] < 0 || canvasPos[1] < 0 || canvasPos[0] > rect.width || canvasPos[1] > rect.height) {
+        return undefined;
+    }
+
+    let world: Point3;
+    try {
+        world = viewport.canvasToWorld(canvasPos);
+    } catch {
+        return undefined;
+    }
+
+    const [i, j, k] = volume.imageData.worldToIndex(world).map((v) => Math.round(v));
+    const [dimX, dimY, dimZ] = volume.voxelManager.dimensions;
+    if (i < 0 || j < 0 || k < 0 || i >= dimX || j >= dimY || k >= dimZ) return undefined;
+    return volume.voxelManager.getAtIJK(i, j, k);
 }
 
 // Centroid (world mm) of every segment label, from one pass over the labelmap. Cached for

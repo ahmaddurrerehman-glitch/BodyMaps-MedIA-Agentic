@@ -741,6 +741,10 @@
    grid bleeding through while the mesh/volume view is still initializing. */
 .vp-pane--render, .vp-pane--render .canvas { background: var(--vp-bg, #08090b); }
 
+/* "Hover to identify" active: a distinct cursor hints the pane now reports the
+   organ under the pointer instead of just navigating. */
+.vp-pane--hover-identify { cursor: help; }
+
 /* ---- Loading overlay (lightweight; no WebGL so it never competes with the
    viewer's NiiVue/Cornerstone contexts) ---- */
 .vp-loading {
@@ -1094,7 +1098,9 @@
   transform: translate(-50%, -50%);
 }
 .vp-spark__marker--flag { background: #ffb454; }
-.vp-stats__row:not(.vp-stats__row--head):nth-child(odd) {
+/* Explicit index-based stripe (not :nth-child) since expanded detail rows are interleaved
+   siblings and would otherwise shift which rows count as "odd". */
+.vp-stats__row--odd {
   background: rgba(255, 255, 255, 0.03);
 }
 .vp-stats__row--head {
@@ -1111,9 +1117,66 @@
   font-weight: 600;
 }
 
+/* Each data row expands in place to reveal the full metric breakdown (median, std dev,
+   skewness, kurtosis, voxel count, min/max HU, truncation flag) — everything
+   calculate_metrics computes, without cluttering the default compact table. */
+.vp-stats__row--expandable {
+  cursor: pointer;
+}
+.vp-stats__row--expandable:hover {
+  background: var(--vp-hover);
+}
+.vp-stats__chevron {
+  display: inline-block;
+  width: 10px;
+  margin-right: 2px;
+  font-size: 10px;
+  color: var(--vp-text-faint);
+  transition: transform 0.15s ease;
+}
+.vp-stats__chevron--open {
+  transform: rotate(90deg);
+}
+.vp-stats__truncated-flag {
+  margin-left: 5px;
+  font-size: 10px;
+  color: #ffb454;
+  cursor: help;
+}
+.vp-stats__detail {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 3px 14px;
+  margin: -2px 4px 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--vp-border);
+}
+.vp-stats__detail-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--vp-mono);
+}
+.vp-stats__detail-item span:first-child {
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--vp-text-faint);
+}
+.vp-stats__detail-item span:last-child {
+  font-size: 11px;
+  color: var(--vp-text-dim);
+}
+
 /* ---- Floating organ tooltip ---- */
 .vp-organ-tip {
   position: fixed;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-family: var(--vp-mono);
   font-size: 11px;
   letter-spacing: 0.02em;
@@ -1122,8 +1185,18 @@
   -webkit-backdrop-filter: blur(8px);
   color: #fff;
   border: 1px solid var(--vp-border);
+  /* Overridden inline per-organ (borderLeftColor) to match its segmentation color. */
+  border-left-width: 3px;
   padding: 5px 9px;
   border-radius: 7px;
   pointer-events: none;
   z-index: 9999;
+}
+/* Small color dot restating the same match, in case the border reads too subtly. */
+.vp-organ-tip__swatch {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
 }

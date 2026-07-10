@@ -16,6 +16,7 @@ import {
     IconClick,
     IconDownload, IconHome, IconListDetails, IconMicrophone, IconPlayerPause, IconPlayerPlay, IconPointer, IconReport,
     IconRuler2,
+    IconScanEye,
     IconSettings,
     IconShare,
     IconSquareDashed,
@@ -26,12 +27,17 @@ import {
 import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useParams } from "react-router-dom";
-import ErrorBoundary from "../components/ErrorBoundary";
-import { SegmentationMeshViewer } from "../components/MeshViewer";
-import OrganCheckbox from "../components/OrganCheckbox";
-import ReportScreen from "../components/ReportScreen/ReportScreen";
 import AISidebar from "../components/AIAssistant/AISidebar";
 import { buildViewerActions } from "../components/AIAssistant/assistantActions";
+import ErrorBoundary from "../components/ErrorBoundary";
+import MaskEditPanel, { type MaskEditMode } from "../components/MaskEditPanel/MaskEditPanel";
+import MeasurementPanel from "../components/MeasurementPanel/MeasurementPanel";
+import { SegmentationMeshViewer } from "../components/MeshViewer";
+import OrganCheckbox from "../components/OrganCheckbox";
+import PercentileBar from "../components/PercentileBar";
+import SessionHUD from "../components/ReadingSession/SessionHUD";
+import SessionSummary from "../components/ReadingSession/SessionSummary";
+import ReportScreen from "../components/ReportScreen/ReportScreen";
 import SnakeGame from "../components/SnakeGame/SnakeGame";
 import {
     API_BASE,
@@ -53,8 +59,10 @@ import {
     ELLIPSE_TOOL,
     enableVolume3D,
     getCrosshairMm,
+    getCurrentVolumeModality,
     getMeasurementSummaries,
     getOrganCentroids,
+    getOrganLabelAtPoint,
     getOrganLabelOnClick,
     LENGTH_TOOL,
     MAGNIFY_TOOL,
@@ -73,7 +81,6 @@ import {
     stopCine,
     subscribeToCrosshairChanges,
     subscribeToMeasurementChanges,
-    getCurrentVolumeModality,
     subscribeToVolumeProgress,
     toggleCrosshairTool,
     undoMaskEdit,
@@ -85,29 +92,25 @@ import {
     type MeasurementToolName,
     type PrimaryMouseToolName
 } from "../helpers/CornerstoneNifti2";
-import MaskEditPanel, { type MaskEditMode } from "../components/MaskEditPanel/MaskEditPanel";
-import MeasurementPanel from "../components/MeasurementPanel/MeasurementPanel";
-import SessionHUD from "../components/ReadingSession/SessionHUD";
-import SessionSummary from "../components/ReadingSession/SessionSummary";
+import { getLocalDicomFiles, loadLocalDicomSeries } from "../helpers/dicomLocal";
+import { downloadUrlAsFile } from "../helpers/downloadFile";
+import {
+    describeBasis,
+    loadOrganNorms,
+    type OrganNorms,
+} from "../helpers/organNorms";
+import {
+    computeStatRows,
+    downloadStats,
+    summarizeOutOfRange,
+    type OrganMetric,
+} from "../helpers/organStatsExport";
 import {
     composeImagesSideBySide,
     ReadingSession,
     type SessionResult,
 } from "../helpers/readingSession";
 import { toolDisplayName, type ReportMeasurement } from "../helpers/sessionReport";
-import { getLocalDicomFiles, loadLocalDicomSeries } from "../helpers/dicomLocal";
-import PercentileBar from "../components/PercentileBar";
-import {
-	describeBasis,
-	loadOrganNorms,
-	type OrganNorms,
-} from "../helpers/organNorms";
-import {
-	computeStatRows,
-	downloadStats,
-	summarizeOutOfRange,
-} from "../helpers/organStatsExport";
-import { downloadUrlAsFile } from "../helpers/downloadFile";
 import { filenameToName, getPanTSId } from "../helpers/utils";
 import { decodeViewerState, encodeViewerState } from "../helpers/viewerShareState";
 import { type CheckBoxData } from "../types";
@@ -115,7 +118,16 @@ import "./VisualizationPage.css";
 
 type ViewMode = "mpr" | "axial" | "sagittal" | "coronal" | "3d";
 
-type OrganStat = { organ_name: string; volume_cm3: number; mean_hu: number };
+type OrganStat = OrganMetric;
+
+// Formats a nullable metric for the organ-stats detail drawer — "—" when the backend
+// didn't compute it (e.g. an empty/degenerate mask), fixed-point otherwise.
+const fmtStat = (v: number | null, digits = 0): string => (v === null ? "—" : v.toFixed(digits));
+
+// Cornerstone's segmentation Color is [r, g, b, a] on a 0–255 scale; CSS wants alpha 0–1.
+// Falls back to a neutral gray if a label has no LUT entry (shouldn't happen in practice).
+const colorToCss = (c: Color | undefined): string =>
+	c ? `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] ?? 255) / 255})` : "rgba(255, 255, 255, 0.4)";
 
 // 3D organ loading animation (three.js) — lazy so its chunk loads alongside the
 // volume download rather than bloating the main viewer bundle.
@@ -180,8 +192,8 @@ function VisualizationPage() {
 			}
 			const id = pantsCase ?? "1";
 			const p = getPanTSId(id);
-			const localCt = `${API_BASE}/api/get-main-nifti/${id}`;
-			const localSeg = `${API_BASE}/api/get-segmentations/${id}`;
+			const localCt = `${API_BASE}/api/get-main-nifti/${id}.nii.gz`;
+			const localSeg = `${API_BASE}/api/get-segmentations/${id}.nii.gz`;
 			const hfCt = `https://huggingface.co/datasets/BodyMaps/iPanTSMini/resolve/main/image_only/${p}/ct.nii.gz?download=true`;
 			const hfSeg = `https://huggingface.co/datasets/BodyMaps/iPanTSMini/resolve/main/mask_only/${p}/combined_labels.nii.gz?download=true`;
 			// HEAD probe: fast, doesn't download the volume; 404/500 → use HF fallback.
@@ -239,6 +251,9 @@ function VisualizationPage() {
 	const [organStats, setOrganStats] = useState<OrganStat[] | null>(null);
 	const [statsLoading, setStatsLoading] = useState(false);
 	const [statsError, setStatsError] = useState(false);
+	// Row index of the organ whose full metric breakdown (median/std dev/skew/kurtosis/...)
+	// is expanded inline. Only one at a time — keeps the panel compact by default.
+	const [expandedStatRow, setExpandedStatRow] = useState<number | null>(null);
 	// Population reference + this case's demographics, used to show each organ's volume
 	// percentile vs the dataset. Both are optional — if the norms asset is missing (e.g. a
 	// dev checkout) or the case has no metadata, the panel just omits the percentile column.
@@ -330,6 +345,15 @@ function VisualizationPage() {
 		x: 0,
 		y: 0,
 		text: "",
+	});
+
+	const [hoverIdentifyEnabled, setHoverIdentifyEnabled] = useState(false);
+	const [hoverOrganTip, setHoverOrganTip] = useState({
+		visible: false,
+		x: 0,
+		y: 0,
+		text: "",
+		color: "transparent",
 	});
 
 	// const location = useLocation();
@@ -577,7 +601,7 @@ function VisualizationPage() {
 			}
 		});
 		try {
-			const newVolumeId = await upgradeCtVolume(`${API_BASE}/api/get-main-nifti/${pantsCase}`);
+			const newVolumeId = await upgradeCtVolume(`${API_BASE}/api/get-main-nifti/${pantsCase}.nii.gz`);
 			if (!newVolumeId) {
 				setEnhance({ state: "failed", pct: null });
 				return;
@@ -1200,6 +1224,32 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 		});
 	};
 
+	// Mousemove handler for the "hover to identify" tool — resolves the organ under the
+	// cursor for one specific pane (via canvasToWorld, not the crosshair) and floats a
+	// tooltip next to the pointer. No-ops entirely while the tool is off.
+	const handlePaneHover = (pane: CinePane) => (e: MouseEvent) => {
+		if (!hoverIdentifyEnabled) return;
+		const idx = getOrganLabelAtPoint(pane, e.clientX, e.clientY);
+		if (!idx) {
+			setHoverOrganTip((t) => (t.visible ? { ...t, visible: false } : t));
+			return;
+		}
+		const rawLabel = segmentation_categories[idx - 1];
+		setHoverOrganTip({
+			visible: true,
+			x: e.clientX + 14,
+			y: e.clientY + 14,
+			text: rawLabel ? filenameToName(rawLabel) : "Unknown",
+			// Same LUT the mask overlay is rendered with, so the swatch/border always
+			// matches the color the organ is actually painted in the pane.
+			color: colorToCss(labelColorMap[idx]),
+		});
+	};
+
+	const handlePaneHoverLeave = () => {
+		setHoverOrganTip((t) => (t.visible ? { ...t, visible: false } : t));
+	};
+
 	const navBack = () => {
 		window.location.href = "/dashboard";
 	};
@@ -1419,6 +1469,20 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 											>
 												<IconZoomIn size={20} color={activeMeasureTool === MAGNIFY_TOOL ? "#08090b" : "white"} />
 												<span className="vp-tool__tip">Magnify (G) — click a pane to place a loupe</span>
+											</button>
+											<button
+												className={`vp-tool ${hoverIdentifyEnabled ? "vp-tool--active" : ""}`}
+												onClick={() => {
+													setHoverIdentifyEnabled((v) => !v);
+													setHoverOrganTip((t) => (t.visible ? { ...t, visible: false } : t));
+												}}
+												aria-pressed={hoverIdentifyEnabled}
+												aria-label="Hover to identify organ"
+											>
+												<IconScanEye size={20} color={hoverIdentifyEnabled ? "#08090b" : "white"} />
+												<span className="vp-tool__tip">
+													{hoverIdentifyEnabled ? "Hover identify: on" : "Hover identify — name the organ under the cursor"}
+												</span>
 											</button>
 											<button
 												className={`vp-tool ${cinePlaying ? "vp-tool--active" : ""}`}
@@ -1733,26 +1797,32 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 					}}
 				>
 					<div
-						className={`axial ${loading ? "" : "vp-pane vp-pane--axial"}`}
+						className={`axial ${loading ? "" : "vp-pane vp-pane--axial"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}`}
 						data-label="Axial"
 						ref={axial_ref}
 						style={panelStyle("axial")}
 						onClick={(e) => { handleMouseClick(e); }}
+						onMouseMove={handlePaneHover("axial")}
+						onMouseLeave={handlePaneHoverLeave}
 					></div>
 					<div
-						className={`sagittal ${loading ? "" : "vp-pane vp-pane--sagittal"}`}
+						className={`sagittal ${loading ? "" : "vp-pane vp-pane--sagittal"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}`}
 						data-label="Sagittal"
 						ref={sagittal_ref}
 						style={panelStyle("sagittal")}
 						onClick={(e) => { handleMouseClick(e); }}
+						onMouseMove={handlePaneHover("sagittal")}
+						onMouseLeave={handlePaneHoverLeave}
 					></div>
 
 					<div
-						className={`coronal ${loading ? "" : "vp-pane vp-pane--coronal"}`}
+						className={`coronal ${loading ? "" : "vp-pane vp-pane--coronal"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}`}
 						data-label="Coronal"
 						ref={coronal_ref}
 						style={panelStyle("coronal")}
 						onClick={(e) => { handleMouseClick(e); }}
+						onMouseMove={handlePaneHover("coronal")}
+						onMouseLeave={handlePaneHoverLeave}
 					></div>
 
 					<div className={`render ${loading ? "" : "vp-pane vp-pane--render"}`} data-label="3D" style={panelStyle("3d")}>
@@ -1816,6 +1886,16 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 				</div>
 			</div>
 
+			{hoverOrganTip.visible && (
+				<div
+					className="vp-organ-tip"
+					style={{ left: hoverOrganTip.x, top: hoverOrganTip.y, borderLeftColor: hoverOrganTip.color }}
+				>
+					<span className="vp-organ-tip__swatch" style={{ background: hoverOrganTip.color }} />
+					{hoverOrganTip.text}
+				</div>
+			)}
+
 			{showStats && (
 				<div className="vp-stats">
 					<div className="vp-stats__head">
@@ -1878,31 +1958,92 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 								</div>
 								{statRows.map((r, i) => {
 									const flagged = r.percentile !== null && (r.percentile < 5 || r.percentile > 95);
+									const expanded = expandedStatRow === i;
 									return (
-										<div className="vp-stats__row" key={`${r.organ_name}-${i}`}>
-											<span>{r.label}</span>
-											<span>{r.volume_cm3 === null ? "NA" : `${Math.round(r.volume_cm3)} cm³`}</span>
-											<span>{r.mean_hu === null ? "NA" : Math.round(r.mean_hu)}</span>
-											{organNorms && (
-												<span
-													className={`vp-stats__pct${flagged ? " vp-stats__pct--flag" : ""}`}
-													title={
-														r.percentile !== null
-															? `${Math.round(r.percentile)}th percentile vs ${describeBasis(r.basis as string)} (n=${r.n})`
-															: "No reference group for this organ"
+										<React.Fragment key={`${r.organ_name}-${i}`}>
+											<div
+												className={`vp-stats__row vp-stats__row--expandable${i % 2 === 1 ? " vp-stats__row--odd" : ""}`}
+												role="button"
+												tabIndex={0}
+												aria-expanded={expanded}
+												onClick={() => setExpandedStatRow(expanded ? null : i)}
+												onKeyDown={(e) => {
+													if (e.key === "Enter" || e.key === " ") {
+														e.preventDefault();
+														setExpandedStatRow(expanded ? null : i);
 													}
-												>
-													{r.percentile !== null ? (
-														<>
-															<span className="vp-stats__pctnum">p{Math.round(r.percentile)}</span>
-															<PercentileBar percentile={r.percentile} flagged={flagged} />
-														</>
-													) : (
-														"—"
+												}}
+											>
+												<span>
+													<span className={`vp-stats__chevron${expanded ? " vp-stats__chevron--open" : ""}`}>
+														›
+													</span>
+													{r.label}
+													{r.truncated && (
+														<span className="vp-stats__truncated-flag" title="Mask reaches the volume edge — metrics may be clipped">
+															⚠
+														</span>
 													)}
 												</span>
+												<span>{r.volume_cm3 === null ? "NA" : `${Math.round(r.volume_cm3)} cm³`}</span>
+												<span>{r.mean_hu === null ? "NA" : Math.round(r.mean_hu)}</span>
+												{organNorms && (
+													<span
+														className={`vp-stats__pct${flagged ? " vp-stats__pct--flag" : ""}`}
+														title={
+															r.percentile !== null
+																? `${Math.round(r.percentile)}th percentile vs ${describeBasis(r.basis as string)} (n=${r.n})`
+																: "No reference group for this organ"
+														}
+													>
+														{r.percentile !== null ? (
+															<>
+																<span className="vp-stats__pctnum">p{Math.round(r.percentile)}</span>
+																<PercentileBar percentile={r.percentile} flagged={flagged} />
+															</>
+														) : (
+															"—"
+														)}
+													</span>
+												)}
+											</div>
+											{expanded && (
+												<div className="vp-stats__detail">
+													<div className="vp-stats__detail-item">
+														<span>Median HU</span>
+														<span>{fmtStat(r.median)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Std Dev HU</span>
+														<span>{fmtStat(r.standard_deviation)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Min HU</span>
+														<span>{fmtStat(r.min_value)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Max HU</span>
+														<span>{fmtStat(r.max_value)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Skewness</span>
+														<span>{fmtStat(r.skewness, 2)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Kurtosis</span>
+														<span>{fmtStat(r.kurtosis, 2)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Voxel Count</span>
+														<span>{r.voxel_count === null ? "—" : r.voxel_count.toLocaleString()}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Truncated</span>
+														<span>{r.truncated ? "Yes" : "No"}</span>
+													</div>
+												</div>
 											)}
-										</div>
+										</React.Fragment>
 									);
 								})}
 							</div>

@@ -328,7 +328,7 @@ def get_mask_data():
     return jsonify(result)
 
   
-@api_blueprint.route('/get-main-nifti/<clabel_id>', methods=['GET'])
+@api_blueprint.route('/get-main-nifti/<clabel_id>.nii.gz', methods=['GET'])
 def get_main_nifti(clabel_id):
     if not _is_safe_id(clabel_id):
         return jsonify({"error": "Invalid id"}), 400
@@ -441,7 +441,7 @@ async def get_specific_segmentations(combined_labels_id):
         return response
     except Exception as e: 
         return jsonify({"error": f"Error loading organ metrics: {str(e)}"}), 500
-@api_blueprint.route('/get-segmentations/<combined_labels_id>', methods=['GET'])
+@api_blueprint.route('/get-segmentations/<combined_labels_id>.nii.gz', methods=['GET'])
 async def get_segmentations(combined_labels_id):
     if not _is_safe_id(combined_labels_id):
         return jsonify({"error": "Invalid id"}), 400

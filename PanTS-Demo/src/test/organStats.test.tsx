@@ -18,6 +18,7 @@ vi.mock("@niivue/niivue", () => ({
 
 vi.mock("../helpers/CornerstoneNifti2", () => ({
 	getOrganLabelOnClick: vi.fn(),
+	getOrganLabelAtPoint: vi.fn(() => undefined),
 	moveCornerstoneCrosshairToMm: vi.fn(),
 	// The page destructures { renderingEngine, viewportIds, volumeId } off the result,
 	// so resolve that shape (not undefined) to avoid a post-test unhandled rejection.

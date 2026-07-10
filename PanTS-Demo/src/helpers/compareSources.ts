@@ -8,8 +8,8 @@ import { getPanTSId } from "./utils";
 // Local volume+mask first (fast, low-res); HuggingFace mirror fallback — same sources the
 // single viewer uses, so coverage is identical.
 export async function resolveSources(id: string): Promise<{ ct: string; seg: string }> {
-	const localCt = `${API_BASE}/api/get-main-nifti/${id}`;
-	const localSeg = `${API_BASE}/api/get-segmentations/${id}`;
+	const localCt = `${API_BASE}/api/get-main-nifti/${id}.nii.gz`;
+	const localSeg = `${API_BASE}/api/get-segmentations/${id}.nii.gz`;
 	const p = getPanTSId(id);
 	const hfCt = `https://huggingface.co/datasets/BodyMaps/iPanTSMini/resolve/main/image_only/${p}/ct.nii.gz?download=true`;
 	const hfSeg = `https://huggingface.co/datasets/BodyMaps/iPanTSMini/resolve/main/mask_only/${p}/combined_labels.nii.gz?download=true`;

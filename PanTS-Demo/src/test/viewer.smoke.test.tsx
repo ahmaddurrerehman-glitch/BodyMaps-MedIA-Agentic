@@ -19,6 +19,7 @@ vi.mock("@niivue/niivue", () => ({
 
 vi.mock("../helpers/CornerstoneNifti2", () => ({
 	getOrganLabelOnClick: vi.fn(),
+	getOrganLabelAtPoint: vi.fn(() => undefined),
 	moveCornerstoneCrosshairToMm: vi.fn(),
 	renderVisualization: vi.fn().mockResolvedValue(undefined),
 	setToolGroupOpacity: vi.fn(),
