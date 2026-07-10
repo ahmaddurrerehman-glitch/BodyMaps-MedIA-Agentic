@@ -38,9 +38,44 @@ vi.mock("../helpers/CornerstoneNifti2", () => ({
 	centerOnCursor: vi.fn(),
 	setZoom: vi.fn(),
 	zoomToFit: vi.fn(),
+	getMeasurementSummaries: vi.fn(() => []),
+	subscribeToMeasurementChanges: vi.fn(() => () => {}),
+	captureViewportImages: vi.fn(async () => []),
+	renameMeasurement: vi.fn(),
+	removeMeasurement: vi.fn(),
+	jumpToMeasurement: vi.fn(() => null),
+	// Progressive full-res upgrade + shaded volume rendering (3D pane)
+	upgradeCtVolume: vi.fn(async () => null),
+	enableVolume3D: vi.fn(async () => false),
+	disableVolume3D: vi.fn(),
+	applyVolume3DPreset: vi.fn(),
+	VOLUME_3D_PRESETS: [{ name: "CT-Bone", label: "Bone" }],
+	VOLUME_3D_PRESETS_MR: [{ name: "MR-Default", label: "Default" }],
+	getCurrentVolumeModality: () => undefined,
+	// Mask editing (brush/eraser + labelmap export)
+	setActiveMaskEditTool: vi.fn(),
+	setActiveEditSegment: vi.fn(),
+	setMaskBrushSize: vi.fn(),
+	undoMaskEdit: vi.fn(),
+	redoMaskEdit: vi.fn(),
+	getMaskEditHistoryState: vi.fn(() => ({ canUndo: false, canRedo: false })),
+	subscribeToSegmentationEdits: vi.fn(() => () => {}),
+	getSegmentationExport: vi.fn(() => null),
+	hasSegmentation: vi.fn(() => false),
+	EDIT_BRUSH: "MaskBrush",
+	EDIT_ERASER: "MaskEraser",
 	LENGTH_TOOL: "Length",
 	PROBE_TOOL: "Probe",
 	ROI_TOOL: "RectangleROI",
+	ANGLE_TOOL: "Angle",
+	ELLIPSE_TOOL: "EllipticalROI",
+	BIDIRECTIONAL_TOOL: "Bidirectional",
+	ARROW_TOOL: "ArrowAnnotate",
+	MAGNIFY_TOOL: "AdvancedMagnify",
+	// Cine playback + oblique-MPR reset
+	startCine: vi.fn(() => false),
+	stopCine: vi.fn(),
+	resetMprOrientation: vi.fn(),
 }));
 
 vi.mock("../helpers/NiiVueNifti", () => ({
@@ -124,8 +159,8 @@ describe("Organ Statistics — population percentiles", () => {
 	it("shows each organ's volume percentile vs the dataset for the case's sex/age", async () => {
 		renderViewer();
 
-		// The toolbar is hidden until the controls panel is opened.
-		fireEvent.click(screen.getByLabelText("Toggle controls"));
+		// The toolbar is hidden by default; reveal it, then open Organ statistics.
+		fireEvent.click(screen.getByLabelText("Toggle toolbar"));
 		fireEvent.click(screen.getByLabelText("Organ statistics"));
 
 		// The %ile column header only appears once the norms asset has loaded.
@@ -149,8 +184,8 @@ describe("Organ Statistics — population percentiles", () => {
 
 	it("falls back to an em dash when an organ has no reference or an invalid volume", async () => {
 		renderViewer();
-		// The toolbar is hidden until the controls panel is opened.
-		fireEvent.click(screen.getByLabelText("Toggle controls"));
+		// The toolbar is hidden by default; reveal it, then open Organ statistics.
+		fireEvent.click(screen.getByLabelText("Toggle toolbar"));
 		fireEvent.click(screen.getByLabelText("Organ statistics"));
 		await screen.findByText("%ile");
 
