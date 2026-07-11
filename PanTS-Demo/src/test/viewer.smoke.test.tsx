@@ -19,9 +19,13 @@ vi.mock("@niivue/niivue", () => ({
 
 vi.mock("../helpers/CornerstoneNifti2", () => ({
 	getOrganLabelOnClick: vi.fn(),
+	getOrganLabelAtPoint: vi.fn(() => undefined),
 	moveCornerstoneCrosshairToMm: vi.fn(),
 	renderVisualization: vi.fn().mockResolvedValue(undefined),
-	setToolGroupOpacity: vi.fn(),
+	setFillOpacity: vi.fn(),
+	setPaneSliceIndex: vi.fn(),
+	subscribeToSliceChanges: vi.fn(() => () => {}),
+	setOutlineOpacity: vi.fn(),
 	setVisibilities: vi.fn(),
 	subscribeToCrosshairChanges: vi.fn(),
 	subscribeToVolumeProgress: vi.fn(() => () => {}),
@@ -66,12 +70,16 @@ vi.mock("../helpers/CornerstoneNifti2", () => ({
 	ROI_TOOL: "RectangleROI",
 	ANGLE_TOOL: "Angle",
 	ELLIPSE_TOOL: "EllipticalROI",
+	FREEHAND_ROI_TOOL: "PlanarFreehandROI",
 	BIDIRECTIONAL_TOOL: "Bidirectional",
 	ARROW_TOOL: "ArrowAnnotate",
 	MAGNIFY_TOOL: "AdvancedMagnify",
 	// Cine playback + oblique-MPR reset
 	startCine: vi.fn(() => false),
 	stopCine: vi.fn(),
+	setReferenceLinesEnabled: vi.fn(),
+	flipPaneHorizontal: vi.fn(),
+	rotatePane90Clockwise: vi.fn(),
 	resetMprOrientation: vi.fn(),
 }));
 
@@ -80,11 +88,6 @@ vi.mock("../helpers/NiiVueNifti", () => ({
 	moveNiiVueCrosshairToMm: vi.fn(),
 	updateVisibilities: vi.fn(),
 }));
-
-vi.mock("../components/Loading", async () => {
-	const React = await import("react");
-	return { default: () => React.createElement("div", { "data-testid": "viewer-loader" }) };
-});
 
 import VisualizationPage from "../routes/VisualizationPage";
 

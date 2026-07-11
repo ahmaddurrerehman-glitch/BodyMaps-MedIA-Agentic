@@ -83,13 +83,16 @@ describe("toCsv", () => {
 	const lines = csv.split("\n");
 
 	it("starts with a header row", () => {
-		expect(lines[0]).toBe("Organ,Volume (cm3),Mean HU,Percentile,Reference group,n");
+		expect(lines[0]).toBe(
+			"Organ,Volume (cm3),Mean HU,Median HU,Std Dev HU,Min HU,Max HU,Skewness,Kurtosis,Voxel Count,Truncated,Percentile,Reference group,n"
+		);
 	});
 
 	it("renders invalid metrics as NA and missing percentiles as blank", () => {
 		const stomachLine = lines.find((l) => l.toLowerCase().includes("stomach"))!;
-		// volume + HU are NA; percentile, group, n are empty.
-		expect(stomachLine).toContain(",NA,NA,,,");
+		// volume + HU are NA; the extra detail metrics are also NA (absent from the fixture);
+		// truncated defaults to No; percentile, group, n are empty.
+		expect(stomachLine).toContain(",NA,NA,NA,NA,NA,NA,NA,NA,NA,No,,,");
 	});
 
 	it("includes the readable reference group", () => {
@@ -102,7 +105,23 @@ describe("toCsv", () => {
 	it("quotes cells that contain commas", () => {
 		// describeBasis never emits commas, but verify the escaper directly via a label.
 		const tricky = toCsv([
-			{ organ_name: "x", label: "a, b", volume_cm3: 1, mean_hu: 2, percentile: null, basis: null, n: null },
+			{
+				organ_name: "x",
+				label: "a, b",
+				volume_cm3: 1,
+				mean_hu: 2,
+				percentile: null,
+				basis: null,
+				n: null,
+				median: null,
+				standard_deviation: null,
+				skewness: null,
+				kurtosis: null,
+				voxel_count: null,
+				min_value: null,
+				max_value: null,
+				truncated: false,
+			},
 		]);
 		expect(tricky).toContain('"a, b"');
 	});

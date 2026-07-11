@@ -1,5 +1,5 @@
 import { cache, init as coreInit, Enums, eventTarget, getRenderingEngine, imageLoader, metaData, RenderingEngine, setVolumesForViewports, utilities as csCoreUtils, volumeLoader } from "@cornerstonejs/core";
-import type { ColorLUT } from "@cornerstonejs/core/types";
+import type { ColorLUT, Point2, Point3 } from "@cornerstonejs/core/types";
 import { cornerstoneNiftiImageLoader, createNiftiImageIdsAndCacheMetadata, init as niftiImageLoaderInit } from "@cornerstonejs/nifti-volume-loader";
 import * as cornerstoneTools from '@cornerstonejs/tools';
 import { init as cornerstoneToolsInit } from '@cornerstonejs/tools';
@@ -21,25 +21,30 @@ const {
     RectangleROITool,
     AngleTool,
     EllipticalROITool,
+    PlanarFreehandROITool,
     BidirectionalTool,
     ArrowAnnotateTool,
     AdvancedMagnifyTool,
     BrushTool,
     TrackballRotateTool,
+    ReferenceLinesTool,
 } = cornerstoneTools;
 
 // Measurement tools the toolbar can switch the primary mouse button to. Length =
 // distance in mm, Bidirectional = long + short axis (RECIST), Probe = HU readout
-// at a point, RectangleROI/EllipticalROI = area + mean/max/min HU, Angle = angle
-// in degrees between two segments, Arrow = labeled pointer at a finding.
+// at a point, RectangleROI/EllipticalROI/FreehandROI = area + mean/max/min HU (the
+// freehand one traces an arbitrary closed outline instead of a fixed rect/ellipse
+// shape), Angle = angle in degrees between two segments, Arrow = labeled pointer at
+// a finding.
 export const LENGTH_TOOL = LengthTool.toolName;
 export const BIDIRECTIONAL_TOOL = BidirectionalTool.toolName;
 export const PROBE_TOOL = ProbeTool.toolName;
 export const ROI_TOOL = RectangleROITool.toolName;
 export const ANGLE_TOOL = AngleTool.toolName;
 export const ELLIPSE_TOOL = EllipticalROITool.toolName;
+export const FREEHAND_ROI_TOOL = PlanarFreehandROITool.toolName;
 export const ARROW_TOOL = ArrowAnnotateTool.toolName;
-export const MEASUREMENT_TOOL_NAMES = [LENGTH_TOOL, BIDIRECTIONAL_TOOL, ANGLE_TOOL, PROBE_TOOL, ROI_TOOL, ELLIPSE_TOOL, ARROW_TOOL] as const;
+export const MEASUREMENT_TOOL_NAMES = [LENGTH_TOOL, BIDIRECTIONAL_TOOL, ANGLE_TOOL, PROBE_TOOL, ROI_TOOL, ELLIPSE_TOOL, FREEHAND_ROI_TOOL, ARROW_TOOL] as const;
 export type MeasurementToolName = (typeof MEASUREMENT_TOOL_NAMES)[number];
 
 // Magnify is a viewing aid, not a measurement: it shares the activation path (one
@@ -214,6 +219,56 @@ function getReferenceLineSlabThicknessControlsOn(viewportId: viewportIdTypes) {
         [viewportId1, viewportId2, viewportId3].indexOf(viewportId);
     return index !== -1;
 }
+
+// ---------------------------------------------------------------------------
+// Reference lines (OHIF-style) — a passive overlay showing where the pane the
+// user is actively scrolling through cuts the OTHER two, independent of
+// whatever tool currently owns the primary mouse button. Deliberately separate
+// from CrosshairsTool: that tool ALSO draws intersection lines, but only while
+// it's the active navigation tool — they vanish the instant you switch to Pan,
+// a measurement tool, or mask editing. Reference lines should keep showing then.
+//
+// Only ONE source is ever active at a time (the pane most recently scrolled),
+// matching how OHIF drives its "active viewport" reference lines rather than
+// showing all three planes' lines simultaneously, which gets noisy fast.
+// Cornerstone's ReferenceLinesTool tracks one `sourceViewportId` per instance
+// and draws that source plane into every OTHER viewport with the instance
+// enabled — so three named instances are registered (one per possible source)
+// and exactly one is enabled at a time; the other two stay disabled.
+// ---------------------------------------------------------------------------
+const REFERENCE_LINES_INSTANCE_BY_SOURCE: Record<viewportIdTypes, string> = {
+    [viewportId1]: "ReferenceLines_Axial",
+    [viewportId2]: "ReferenceLines_Sagittal",
+    [viewportId3]: "ReferenceLines_Coronal",
+};
+const REFERENCE_LINES_INSTANCE_NAMES = Object.values(REFERENCE_LINES_INSTANCE_BY_SOURCE);
+// SVG stroke-dasharray — a fine dotted line reads as a passive reference, distinct from
+// the crosshair's solid navigation lines.
+const REFERENCE_LINE_DASH = "1,5";
+
+function _referenceLinesSourceViewportId(pane: CinePane): viewportIdTypes {
+    return pane === "axial" ? viewportId1 : pane === "sagittal" ? viewportId2 : viewportId3;
+}
+
+// enabled=false disables all three instances. enabled=true enables only the instance
+// sourced from `sourcePane` (defaulting to axial) and disables the other two — call this
+// again with a different pane whenever the user scrolls a different one.
+export function setReferenceLinesEnabled(enabled: boolean, sourcePane: CinePane = "axial") {
+    const toolGroup = ToolGroupManager.getToolGroup(toolGroupId);
+    if (!toolGroup) return;
+    const activeInstance = enabled ? REFERENCE_LINES_INSTANCE_BY_SOURCE[_referenceLinesSourceViewportId(sourcePane)] : null;
+    for (const instanceName of REFERENCE_LINES_INSTANCE_NAMES) {
+        if (instanceName === activeInstance) {
+            toolGroup.setToolEnabled(instanceName);
+        } else {
+            toolGroup.setToolDisabled(instanceName);
+        }
+    }
+    if (currentRenderingEngine) {
+        currentRenderingEngine.renderViewports([viewportId1, viewportId2, viewportId3]);
+        currentRenderingEngine.render();
+    }
+}
 // Subscribe to the nifti loader's real download progress (bytes loaded / total) so
 // the UI can show an accurate, measured ETA. Returns an unsubscribe fn.
 export function subscribeToVolumeProgress(
@@ -265,10 +320,12 @@ export async function renderVisualization(ref1: HTMLDivElement, ref2: HTMLDivEle
     cornerstoneTools.addTool(RectangleROITool);
     cornerstoneTools.addTool(AngleTool);
     cornerstoneTools.addTool(EllipticalROITool);
+    cornerstoneTools.addTool(PlanarFreehandROITool);
     cornerstoneTools.addTool(BidirectionalTool);
     cornerstoneTools.addTool(ArrowAnnotateTool);
     cornerstoneTools.addTool(AdvancedMagnifyTool);
     cornerstoneTools.addTool(BrushTool);
+    cornerstoneTools.addTool(ReferenceLinesTool);
     toolGroup.addTool(PanTool.toolName);
     toolGroup.addTool(ZoomTool.toolName);
     toolGroup.addTool(StackScrollTool.toolName);
@@ -277,6 +334,12 @@ export async function renderVisualization(ref1: HTMLDivElement, ref2: HTMLDivEle
     toolGroup.addTool(RectangleROITool.toolName);
     toolGroup.addTool(AngleTool.toolName);
     toolGroup.addTool(EllipticalROITool.toolName);
+    // allowOpenContours: false — always auto-close into a polygon so it behaves like
+    // the other ROI tools (area + mean/min/max HU), not an open freehand line.
+    toolGroup.addTool(PlanarFreehandROITool.toolName, {
+        calculateStats: true,
+        allowOpenContours: false,
+    });
     toolGroup.addTool(BidirectionalTool.toolName);
     toolGroup.addTool(ArrowAnnotateTool.toolName);
     toolGroup.addTool(AdvancedMagnifyTool.toolName);
@@ -307,6 +370,25 @@ export async function renderVisualization(ref1: HTMLDivElement, ref2: HTMLDivEle
         },
         handleRadius:8
     })
+    // Reference lines: one instance per pane as the "source", each showing that pane's
+    // slice position as a colored line in the OTHER two — starts disabled (opt-in tool).
+    for (const sourceViewportId of [viewportId1, viewportId2, viewportId3] as viewportIdTypes[]) {
+        const instanceName = REFERENCE_LINES_INSTANCE_BY_SOURCE[sourceViewportId];
+        toolGroup.addToolInstance(instanceName, ReferenceLinesTool.toolName, {
+            sourceViewportId,
+            enforceSameFrameOfReference: true,
+            showFullDimension: false,
+        });
+        annotation.config.style.setToolGroupToolStyles(toolGroupId, {
+            ...annotation.config.style.getToolGroupToolStyles(toolGroupId),
+            [instanceName]: {
+                color: getReferenceLineColor(sourceViewportId),
+                lineWidth: 1.5,
+                lineDash: REFERENCE_LINE_DASH,
+            },
+        });
+        toolGroup.setToolDisabled(instanceName);
+    }
     if (!_crosshairListenerRegistered) {
         eventTarget.addEventListener(cornerstoneTools.Enums.Events.CROSSHAIR_TOOL_CENTER_CHANGED, _handleCrosshairCenterChanged);
         _crosshairListenerRegistered = true;
@@ -486,27 +568,44 @@ export function setVisibilities(checkState: boolean[]) {
 };
 
 
-export function setToolGroupOpacity(opacityValue: number) {
-    const newSegConfig = { ...DEFAULT_SEGMENTATION_CONFIG };
-    newSegConfig.fillAlpha = opacityValue;
-    newSegConfig.fillAlphaInactive = opacityValue;
-    newSegConfig.outlineOpacity = opacityValue;
-    newSegConfig.outlineOpacityInactive = opacityValue;
-    segmentation.config.style.setStyle({
-        type: csToolsEnums.SegmentationRepresentations.Labelmap,
-        segmentationId: segmentationId,
-    }, {
-        ...DEFAULT_SEGMENTATION_CONFIG,
-        fillAlpha: opacityValue / 2.4,
-        fillAlphaInactive: opacityValue / 2.4,
-        outlineOpacity: opacityValue / 2.4,
-        outlineOpacityInactive: opacityValue / 2.4,
-
-    });
+// Fill (the solid organ color wash) and outline (the border traced around each segment)
+// are independently controllable — both 0–1. Previously a single "opacity" divided
+// whatever value it was given by 2.4 before applying it, so even 100% only ever reached
+// ~42% actual alpha; that division is gone. renderOutline defaults to false in
+// DEFAULT_SEGMENTATION_CONFIG (no border at all, regardless of outlineOpacity), so this
+// also flips it on/off based on whether the outline slider is above zero.
+// SegmentationStyle.setStyle merges onto the existing style by default (its `merge`
+// param defaults to true), so fill and outline can each be set independently without
+// either call needing to know the other's current value.
+function _setSegmentationStyle(style: Record<string, unknown>) {
+    segmentation.config.style.setStyle(
+        { type: csToolsEnums.SegmentationRepresentations.Labelmap, segmentationId },
+        style as Parameters<typeof segmentation.config.style.setStyle>[1]
+    );
     if (currentRenderingEngine) {
         currentRenderingEngine.renderViewports([viewportId1, viewportId2, viewportId3]);
         currentRenderingEngine.render();
     }
+}
+
+export function setFillOpacity(fillOpacity: number) {
+    _setSegmentationStyle({
+        renderFill: fillOpacity > 0,
+        fillAlpha: fillOpacity,
+        fillAlphaInactive: fillOpacity,
+    });
+}
+
+// renderOutline defaults to false in DEFAULT_SEGMENTATION_CONFIG (no border at all,
+// regardless of outlineOpacity), so this flips it on/off based on whether the slider
+// is above zero.
+export function setOutlineOpacity(outlineOpacity: number) {
+    _setSegmentationStyle({
+        renderOutline: outlineOpacity > 0,
+        outlineOpacity: outlineOpacity,
+        outlineOpacityInactive: outlineOpacity,
+        outlineWidth: DEFAULT_SEGMENTATION_CONFIG.outlineWidth,
+    });
 }
 
 export function toggleCrosshairTool(enable: boolean) {
@@ -729,7 +828,12 @@ function formatAnnotationValue(a: any): string {
 }
 
 function annotationCenter(a: any): [number, number, number] | null {
-  const pts = a?.data?.handles?.points as number[][] | undefined;
+  // Most tools keep their corner/endpoint handles in data.handles.points. The
+  // freehand ROI's outline lives in data.contour.polyline instead (handles.points
+  // stays empty for it) — fall back to averaging that when handles are empty.
+  const pts = (a?.data?.handles?.points?.length
+    ? a.data.handles.points
+    : a?.data?.contour?.polyline) as number[][] | undefined;
   if (!pts?.length) return null;
   const c: [number, number, number] = [0, 0, 0];
   for (const p of pts) { c[0] += p[0]; c[1] += p[1]; c[2] += p[2]; }
@@ -783,7 +887,16 @@ export function jumpToMeasurement(uid: string): [number, number, number] | null 
 
 // ---------------------------------------------------------------------------
 // Cine playback — auto-scroll one MPR pane through its slices at a fixed frame
-// rate (Cornerstone's cine utility natively supports volume viewports).
+// rate. Hand-rolled with a plain setInterval + viewport.scroll(), NOT
+// cornerstoneTools.utilities.cine.playClip: that utility resolves which
+// volume to scroll via an internal "smallest spacing" heuristic across every
+// actor on the viewport when no volumeId is given, and its own volume-viewport
+// play path never passes one — with both the CT volume AND the segmentation
+// labelmap attached to each pane, that heuristic can pick the wrong actor (or
+// one with a degenerate slice range), so nothing visibly moves.
+// viewport.scroll(delta) sidesteps this entirely: it resolves the volume via
+// viewport.getVolumeId() (the same thing StackScrollTool does for wheel-driven
+// scrolling), so it's guaranteed to move the actual displayed CT.
 // ---------------------------------------------------------------------------
 
 export type CinePane = "axial" | "sagittal" | "coronal";
@@ -793,19 +906,46 @@ const CINE_VIEWPORT_BY_PANE: Record<CinePane, string> = {
   coronal: viewportId3,
 };
 
-let _cineElement: HTMLDivElement | null = null;
+// Every per-pane MPR operation (cine, flip, rotate, slice tracking) needs the same cast:
+// IViewport (what getViewport() is typed to return) only exposes the narrower base
+// Viewport surface, but the concrete object is a BaseVolumeViewport where all of this is
+// genuinely present at runtime — same rationale as getCrosshairMm's toolCenter cast
+// elsewhere in this file.
+type MprViewport = {
+  element: HTMLDivElement;
+  scroll(delta?: number): void;
+  getNumberOfSlices(): number;
+  getSliceIndex(): number;
+  flip(flipDirection: { flipHorizontal?: boolean; flipVertical?: boolean }): void;
+  getRotation(): number;
+  setRotation(rotation: number): void;
+  render(): void;
+};
+
+function _getMprViewport(pane: CinePane): MprViewport | undefined {
+  const engine = getRenderingEngine(renderingEngineId);
+  if (!engine) return undefined;
+  return engine.getViewport(CINE_VIEWPORT_BY_PANE[pane]) as unknown as MprViewport | undefined;
+}
+
+let _cineIntervalId: number | null = null;
 
 export function startCine(pane: CinePane, fps = 12): boolean {
   const engine = getRenderingEngine(renderingEngineId);
   if (!engine) return false;
   stopCine(); // one clip at a time
   try {
-    /* eslint-disable-next-line @typescript-eslint/no-explicit-any -- element isn't on IViewport */
-    const viewport = engine.getViewport(CINE_VIEWPORT_BY_PANE[pane]) as any;
-    const element = viewport?.element as HTMLDivElement | undefined;
-    if (!element) return false;
-    cornerstoneTools.utilities.cine.playClip(element, { framesPerSecond: fps, loop: true });
-    _cineElement = element;
+    const viewport = _getMprViewport(pane);
+    if (!viewport) return false;
+    const numSlices = viewport.getNumberOfSlices();
+    if (!numSlices || numSlices < 2) return false;
+    const clampedFps = Math.max(1, Math.min(100, fps));
+    _cineIntervalId = window.setInterval(() => {
+      // Loop back to the first slice once past the last — viewport.scroll clamps
+      // rather than wraps, so a step past the end needs an explicit jump to 0.
+      const current = viewport.getSliceIndex();
+      viewport.scroll(current >= numSlices - 1 ? -current : 1);
+    }, 1000 / clampedFps);
     return true;
   } catch (e) {
     console.warn("Cine playback unavailable:", e);
@@ -814,13 +954,90 @@ export function startCine(pane: CinePane, fps = 12): boolean {
 }
 
 export function stopCine() {
-  if (!_cineElement) return;
+  if (_cineIntervalId === null) return;
+  window.clearInterval(_cineIntervalId);
+  _cineIntervalId = null;
+}
+
+// ---------------------------------------------------------------------------
+// Per-pane flip / rotate — like Cine, these act on whichever pane is currently
+// "in focus" (VisualizationPage tracks that via scroll/click and passes it in).
+// ---------------------------------------------------------------------------
+
+// Mirrors the pane left-right. flip() toggles internally (this.flipHorizontal =
+// !this.flipHorizontal), so calling it again on the same pane un-flips it — the
+// toggle behavior lives in Cornerstone itself, nothing to track on our side.
+// It also self-renders, unlike setRotation below.
+export function flipPaneHorizontal(pane: CinePane): void {
+  const viewport = _getMprViewport(pane);
+  if (!viewport) return;
   try {
-    cornerstoneTools.utilities.cine.stopClip(_cineElement);
-  } catch {
-    /* viewport already torn down */
+    viewport.flip({ flipHorizontal: true });
+  } catch (e) {
+    console.warn(`Flip failed for pane "${pane}":`, e);
   }
-  _cineElement = null;
+}
+
+// Rotates 90° clockwise from wherever the pane currently sits (cumulative — four
+// clicks return to the start). NOTE: cornerstone's rotation-angle sign convention
+// relative to "on-screen clockwise" isn't independently confirmed here — if a
+// case turns out to visibly rotate counter-clockwise instead, flip the `+ 90`
+// below to `- 90` (mod still needs the `+ 360` to stay positive in that case).
+export function rotatePane90Clockwise(pane: CinePane): void {
+  const viewport = _getMprViewport(pane);
+  if (!viewport) return;
+  try {
+    const next = (viewport.getRotation() + 90) % 360;
+    viewport.setRotation(next);
+    // Unlike flip(), setRotation() only triggers a CAMERA_MODIFIED event — it
+    // never calls render() itself, so without this the rotation wouldn't show
+    // until some unrelated interaction happened to re-render the pane.
+    viewport.render();
+  } catch (e) {
+    console.warn(`Rotate failed for pane "${pane}":`, e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Slice tracking — drives the per-pane "245/519" caption + drag scrollbar.
+// ---------------------------------------------------------------------------
+
+export type SliceInfo = { current: number; total: number };
+
+// Jumps a pane directly to an arbitrary slice (the scrollbar drag target), rather than
+// the +1/-1 steps cine/wheel-scroll use. scroll(delta) clamps to the valid range, so an
+// out-of-range index (e.g. from a stale `total`) is harmless.
+export function setPaneSliceIndex(pane: CinePane, index: number): void {
+  const viewport = _getMprViewport(pane);
+  if (!viewport) return;
+  const delta = index - viewport.getSliceIndex();
+  if (delta !== 0) viewport.scroll(delta);
+}
+
+// Fires `cb` once immediately per pane (so the caller has an initial reading) and again
+// on every CAMERA_MODIFIED where the slice index actually changed — pan/zoom/rotate also
+// fire that event, so each pane's last-seen index is compared to avoid spamming the
+// caller (and the React state it likely feeds) on every unrelated camera tweak. Returns
+// an unsubscribe function; call it before the volume/tool group is torn down (case
+// switch, HD reload) since the viewport elements go with it.
+export function subscribeToSliceChanges(cb: (pane: CinePane, info: SliceInfo) => void): () => void {
+  const panes = Object.keys(CINE_VIEWPORT_BY_PANE) as CinePane[];
+  const cleanups: (() => void)[] = [];
+  for (const pane of panes) {
+    const viewport = _getMprViewport(pane);
+    if (!viewport) continue;
+    let lastIndex = viewport.getSliceIndex();
+    cb(pane, { current: lastIndex, total: viewport.getNumberOfSlices() });
+    const handler = () => {
+      const current = viewport.getSliceIndex();
+      if (current === lastIndex) return;
+      lastIndex = current;
+      cb(pane, { current, total: viewport.getNumberOfSlices() });
+    };
+    viewport.element.addEventListener(Enums.Events.CAMERA_MODIFIED, handler);
+    cleanups.push(() => viewport.element.removeEventListener(Enums.Events.CAMERA_MODIFIED, handler));
+  }
+  return () => cleanups.forEach((fn) => fn());
 }
 
 // Undo any oblique-plane rotation / slab thickness back to standard orthogonal
@@ -1301,6 +1518,46 @@ export function getOrganLabelOnClick() {
     // })
     const idx = volume.voxelManager.getAtIJK(indices[0], indices[1], indices[2]);
     return idx;
+}
+
+// Hover variant of getOrganLabelOnClick: resolves the segment label under an arbitrary
+// screen point in one pane, via canvasToWorld → worldToIndex on that pane's own volume
+// geometry. Unlike the click path, this never touches the crosshair (no repositioning
+// side effect), which is what makes it safe to call on every mousemove for the
+// "hover to identify" tool.
+export function getOrganLabelAtPoint(pane: CinePane, clientX: number, clientY: number): number | undefined {
+    const engine = getRenderingEngine(renderingEngineId);
+    if (!engine) return undefined;
+    const viewport = engine.getViewport(CINE_VIEWPORT_BY_PANE[pane]) as unknown as
+        | { getCanvas(): HTMLCanvasElement; canvasToWorld(canvasPos: Point2): Point3 }
+        | undefined;
+    if (!viewport) return undefined;
+    const volume = cache.getVolume(segmentationId);
+    if (!volume || !volume.voxelManager || !volume.imageData) return undefined;
+
+    let canvas: HTMLCanvasElement;
+    try {
+        canvas = viewport.getCanvas();
+    } catch {
+        return undefined;
+    }
+    const rect = canvas.getBoundingClientRect();
+    const canvasPos: Point2 = [clientX - rect.left, clientY - rect.top];
+    if (canvasPos[0] < 0 || canvasPos[1] < 0 || canvasPos[0] > rect.width || canvasPos[1] > rect.height) {
+        return undefined;
+    }
+
+    let world: Point3;
+    try {
+        world = viewport.canvasToWorld(canvasPos);
+    } catch {
+        return undefined;
+    }
+
+    const [i, j, k] = volume.imageData.worldToIndex(world).map((v) => Math.round(v));
+    const [dimX, dimY, dimZ] = volume.voxelManager.dimensions;
+    if (i < 0 || j < 0 || k < 0 || i >= dimX || j >= dimY || k >= dimZ) return undefined;
+    return volume.voxelManager.getAtIJK(i, j, k);
 }
 
 // Centroid (world mm) of every segment label, from one pass over the labelmap. Cached for

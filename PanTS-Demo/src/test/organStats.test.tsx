@@ -18,6 +18,7 @@ vi.mock("@niivue/niivue", () => ({
 
 vi.mock("../helpers/CornerstoneNifti2", () => ({
 	getOrganLabelOnClick: vi.fn(),
+	getOrganLabelAtPoint: vi.fn(() => undefined),
 	moveCornerstoneCrosshairToMm: vi.fn(),
 	// The page destructures { renderingEngine, viewportIds, volumeId } off the result,
 	// so resolve that shape (not undefined) to avoid a post-test unhandled rejection.
@@ -26,7 +27,10 @@ vi.mock("../helpers/CornerstoneNifti2", () => ({
 		viewportIds: [],
 		volumeId: "test-volume",
 	}),
-	setToolGroupOpacity: vi.fn(),
+	setFillOpacity: vi.fn(),
+	setPaneSliceIndex: vi.fn(),
+	subscribeToSliceChanges: vi.fn(() => () => {}),
+	setOutlineOpacity: vi.fn(),
 	setVisibilities: vi.fn(),
 	subscribeToCrosshairChanges: vi.fn(),
 	subscribeToVolumeProgress: vi.fn(() => () => {}),
@@ -69,12 +73,16 @@ vi.mock("../helpers/CornerstoneNifti2", () => ({
 	ROI_TOOL: "RectangleROI",
 	ANGLE_TOOL: "Angle",
 	ELLIPSE_TOOL: "EllipticalROI",
+	FREEHAND_ROI_TOOL: "PlanarFreehandROI",
 	BIDIRECTIONAL_TOOL: "Bidirectional",
 	ARROW_TOOL: "ArrowAnnotate",
 	MAGNIFY_TOOL: "AdvancedMagnify",
 	// Cine playback + oblique-MPR reset
 	startCine: vi.fn(() => false),
 	stopCine: vi.fn(),
+	setReferenceLinesEnabled: vi.fn(),
+	flipPaneHorizontal: vi.fn(),
+	rotatePane90Clockwise: vi.fn(),
 	resetMprOrientation: vi.fn(),
 }));
 
@@ -83,11 +91,6 @@ vi.mock("../helpers/NiiVueNifti", () => ({
 	moveNiiVueCrosshairToMm: vi.fn(),
 	updateVisibilities: vi.fn(),
 }));
-
-vi.mock("../components/Loading", async () => {
-	const React = await import("react");
-	return { default: () => React.createElement("div", { "data-testid": "viewer-loader" }) };
-});
 
 import VisualizationPage from "../routes/VisualizationPage";
 import { __resetOrganNormsCache } from "../helpers/organNorms";
@@ -159,9 +162,11 @@ describe("Organ Statistics — population percentiles", () => {
 	it("shows each organ's volume percentile vs the dataset for the case's sex/age", async () => {
 		renderViewer();
 
-		// The toolbar is hidden by default; reveal it, then open Organ statistics.
+		// The toolbar is hidden by default; reveal it, then open Organ statistics
+		// (grouped under the "Panels" dropdown alongside Organs/Case metadata/Measurements).
 		fireEvent.click(screen.getByLabelText("Toggle toolbar"));
-		fireEvent.click(screen.getByLabelText("Organ statistics"));
+		fireEvent.click(screen.getByLabelText("Panels"));
+		fireEvent.click(screen.getByRole("menuitem", { name: "Organ stats" }));
 
 		// The %ile column header only appears once the norms asset has loaded.
 		expect(await screen.findByText("%ile")).toBeTruthy();
@@ -184,9 +189,11 @@ describe("Organ Statistics — population percentiles", () => {
 
 	it("falls back to an em dash when an organ has no reference or an invalid volume", async () => {
 		renderViewer();
-		// The toolbar is hidden by default; reveal it, then open Organ statistics.
+		// The toolbar is hidden by default; reveal it, then open Organ statistics
+		// (grouped under the "Panels" dropdown alongside Organs/Case metadata/Measurements).
 		fireEvent.click(screen.getByLabelText("Toggle toolbar"));
-		fireEvent.click(screen.getByLabelText("Organ statistics"));
+		fireEvent.click(screen.getByLabelText("Panels"));
+		fireEvent.click(screen.getByRole("menuitem", { name: "Organ stats" }));
 		await screen.findByText("%ile");
 
 		// spleen has no bucket and the kidney volume is flagged → two "—" cells.

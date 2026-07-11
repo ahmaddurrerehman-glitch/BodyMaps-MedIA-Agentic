@@ -1,3 +1,4 @@
+from werkzeug.datastructures import MultiDict, FileStorage
 from flask import Blueprint, send_file, make_response, request, jsonify
 from services.nifti_processor import NiftiProcessor
 from services.session_manager import SessionManager, generate_uuid
@@ -12,7 +13,6 @@ from io import BytesIO
 from datetime import datetime
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
-
 from typing import Any, Dict, Optional, Set, List, Tuple
 
 import os
@@ -76,6 +76,19 @@ def organname_to_name(filename):
     name = filename.replace(".nii.gz", "").replace("_", " ")
     return name.title()
 
+def create_nifti_multi_dict(seg_filenames: list[str], segmentation_path: str):
+    
+    nifti_multi_dict = MultiDict()
+    for filename in seg_filenames:
+        path = os.path.join(segmentation_path, filename)
+        
+        with open(path, 'rb') as file_stream:
+            file_storage = FileStorage(stream=BytesIO(file_stream.read()), filename=filename, content_type='application/gzip')
+            nifti_multi_dict.add(key=filename, value=file_storage)
+    
+    return nifti_multi_dict
+
+
 def get_mask_data_internal(id, fallback=False):
     """Retrieve or compute organ metadata from NIfTI and mask paths for a session."""
     try:
@@ -85,14 +98,22 @@ def get_mask_data_internal(id, fallback=False):
         organ_intensities = None
         
         organ_intensities_path = f"{Constants.PANTS_PATH}/mask_only/{get_panTS_id(id)}/{Constants.ORGAN_INTENSITIES_FILENAME}"
-        if not os.path.exists(organ_intensities_path) or not os.path.exists(combined_labels_path):
-            npz_processor = NpzProcessor()
-            labels, organ_intensities = npz_processor.combine_labels(int(id), keywords={"pancrea": "pancreas"}, save=True)
-        else: 
-            with open(organ_intensities_path, "r") as f:
-                organ_intensities = json.load(f)
         
         nifti_processor = NiftiProcessor(main_nifti_path, combined_labels_path)
+        if not os.path.exists(organ_intensities_path) or not os.path.exists(combined_labels_path):
+            segmentation_path = f"{Constants.PANTS_PATH}/mask_only/{get_panTS_id(id)}/segmentations"
+            seg_filenames = os.listdir(segmentation_path)
+            
+            print(f"[INFO] Creating organ intesities at {organ_intensities_path} for id {id}")
+            
+            nifti_multi_dict = create_nifti_multi_dict(seg_filenames, segmentation_path)
+            combined_labels, organ_intensities = nifti_processor.combine_labels(seg_filenames, nifti_multi_dict, save=False)
+
+            with open(organ_intensities_path, "w") as f:
+                json.dump(organ_intensities, f)
+        with open(organ_intensities_path, "r") as f:
+            organ_intensities = json.load(f)
+        
         nifti_processor.set_organ_intensities(organ_intensities)
         organ_metadata = nifti_processor.calculate_metrics()
         organ_metadata = clean_nan(organ_metadata)

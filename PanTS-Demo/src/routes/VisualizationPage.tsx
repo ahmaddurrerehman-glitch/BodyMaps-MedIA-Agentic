@@ -3,6 +3,7 @@ import type { Color, ColorLUT } from "@cornerstonejs/core/types";
 import type { vtkVolumeProperty } from '@kitware/vtk.js/Rendering/Core/VolumeProperty';
 import { Niivue } from "@niivue/niivue";
 import {
+    IconAdjustmentsHorizontal,
     IconAngle,
     IconArrowBackUp,
     IconArrowForwardUp,
@@ -12,10 +13,21 @@ import {
     IconCamera,
     IconChartBar,
     IconCheck,
+    IconChevronDown,
     IconCircle,
     IconClick,
-    IconDownload, IconHome, IconListDetails, IconMicrophone, IconPlayerPause, IconPlayerPlay, IconPointer, IconReport,
+    IconDownload,
+    IconEye,
+    IconFlipHorizontal,
+    IconGrid3x3,
+    IconHome,
+    IconId,
+    IconLasso,
+    IconLayoutSidebarRight,
+    IconListDetails, IconMicrophone, IconPlayerPause, IconPlayerPlay, IconPointer, IconReport,
+    IconRotateClockwise,
     IconRuler2,
+    IconScanEye,
     IconSettings,
     IconShare,
     IconSquareDashed,
@@ -23,16 +35,19 @@ import {
     IconTrash,
     IconZoomIn
 } from "@tabler/icons-react";
-import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useParams } from "react-router-dom";
-import ErrorBoundary from "../components/ErrorBoundary";
-import { SegmentationMeshViewer } from "../components/MeshViewer";
-import OrganCheckbox from "../components/OrganCheckbox";
-import ReportScreen from "../components/ReportScreen/ReportScreen";
 import AISidebar from "../components/AIAssistant/AISidebar";
 import { buildViewerActions } from "../components/AIAssistant/assistantActions";
-import SnakeGame from "../components/SnakeGame/SnakeGame";
+import MaskEditPanel, { type MaskEditMode } from "../components/MaskEditPanel/MaskEditPanel";
+import MeasurementPanel from "../components/MeasurementPanel/MeasurementPanel";
+import { SegmentationMeshViewer } from "../components/MeshViewer";
+import OrganCheckbox from "../components/OrganCheckbox";
+import PercentileBar from "../components/PercentileBar";
+import SessionHUD from "../components/ReadingSession/SessionHUD";
+import SessionSummary from "../components/ReadingSession/SessionSummary";
+import ReportScreen from "../components/ReportScreen/ReportScreen";
 import {
     API_BASE,
     APP_CONSTANTS,
@@ -52,9 +67,13 @@ import {
     EDIT_ERASER,
     ELLIPSE_TOOL,
     enableVolume3D,
+    flipPaneHorizontal,
+    FREEHAND_ROI_TOOL,
     getCrosshairMm,
+    getCurrentVolumeModality,
     getMeasurementSummaries,
     getOrganCentroids,
+    getOrganLabelAtPoint,
     getOrganLabelOnClick,
     LENGTH_TOOL,
     MAGNIFY_TOOL,
@@ -64,16 +83,20 @@ import {
     renderVisualization,
     resetMprOrientation,
     ROI_TOOL,
+    rotatePane90Clockwise,
     setActiveMaskEditTool,
     setActiveMeasurementTool,
-    setToolGroupOpacity,
+    setFillOpacity,
+    setOutlineOpacity,
+    setPaneSliceIndex,
+    setReferenceLinesEnabled,
     setVisibilities,
     setZoom,
     startCine,
     stopCine,
     subscribeToCrosshairChanges,
     subscribeToMeasurementChanges,
-    getCurrentVolumeModality,
+    subscribeToSliceChanges,
     subscribeToVolumeProgress,
     toggleCrosshairTool,
     undoMaskEdit,
@@ -82,32 +105,28 @@ import {
     VOLUME_3D_PRESETS_MR,
     zoomToFit,
     type CinePane,
-    type MeasurementToolName,
-    type PrimaryMouseToolName
+    type PrimaryMouseToolName,
+    type SliceInfo
 } from "../helpers/CornerstoneNifti2";
-import MaskEditPanel, { type MaskEditMode } from "../components/MaskEditPanel/MaskEditPanel";
-import MeasurementPanel from "../components/MeasurementPanel/MeasurementPanel";
-import SessionHUD from "../components/ReadingSession/SessionHUD";
-import SessionSummary from "../components/ReadingSession/SessionSummary";
+import { getLocalDicomFiles, loadLocalDicomSeries } from "../helpers/dicomLocal";
+import { downloadUrlAsFile } from "../helpers/downloadFile";
+import {
+    describeBasis,
+    loadOrganNorms,
+    type OrganNorms,
+} from "../helpers/organNorms";
+import {
+    computeStatRows,
+    downloadStats,
+    summarizeOutOfRange,
+    type OrganMetric,
+} from "../helpers/organStatsExport";
 import {
     composeImagesSideBySide,
     ReadingSession,
     type SessionResult,
 } from "../helpers/readingSession";
 import { toolDisplayName, type ReportMeasurement } from "../helpers/sessionReport";
-import { getLocalDicomFiles, loadLocalDicomSeries } from "../helpers/dicomLocal";
-import PercentileBar from "../components/PercentileBar";
-import {
-	describeBasis,
-	loadOrganNorms,
-	type OrganNorms,
-} from "../helpers/organNorms";
-import {
-	computeStatRows,
-	downloadStats,
-	summarizeOutOfRange,
-} from "../helpers/organStatsExport";
-import { downloadUrlAsFile } from "../helpers/downloadFile";
 import { filenameToName, getPanTSId } from "../helpers/utils";
 import { decodeViewerState, encodeViewerState } from "../helpers/viewerShareState";
 import { type CheckBoxData } from "../types";
@@ -115,11 +134,86 @@ import "./VisualizationPage.css";
 
 type ViewMode = "mpr" | "axial" | "sagittal" | "coronal" | "3d";
 
-type OrganStat = { organ_name: string; volume_cm3: number; mean_hu: number };
+// OHIF-style "hanging protocol" layouts for the MPR grid: besides the equal 2×2 grid,
+// one pane can be given the lion's share of the space while the other three stack down
+// a narrow side column — same idea as OHIF's asymmetric layouts, just a fixed small set
+// of presets rather than a free-form layout editor. Only meaningful while viewMode is
+// "mpr" (the single-view and 3d-fullscreen modes already dedicate 100% to one pane).
+type LayoutPreset = "grid" | "axial-primary" | "sagittal-primary" | "coronal-primary" | "3d-primary";
 
-// 3D organ loading animation (three.js) — lazy so its chunk loads alongside the
-// volume download rather than bloating the main viewer bundle.
-const RotatingModelLoader = lazy(() => import("../components/Loading"));
+const LAYOUT_PRESETS: { id: LayoutPreset; label: string }[] = [
+	{ id: "grid", label: "Equal" },
+	{ id: "axial-primary", label: "Axial Large" },
+	{ id: "sagittal-primary", label: "Sagittal Large" },
+	{ id: "coronal-primary", label: "Coronal Large" },
+	{ id: "3d-primary", label: "3D Large" },
+];
+
+// Which pane each non-"grid" preset enlarges. The other three fill the remaining
+// narrow column, in this fixed top-to-bottom order (primary pane excluded).
+const LAYOUT_PRESET_PRIMARY: Record<Exclude<LayoutPreset, "grid">, ViewMode> = {
+	"axial-primary": "axial",
+	"sagittal-primary": "sagittal",
+	"coronal-primary": "coronal",
+	"3d-primary": "3d",
+};
+const LAYOUT_PANE_ORDER: ViewMode[] = ["axial", "sagittal", "coronal", "3d"];
+
+// View-mode picker + pane-layout preset picker are both "ways to view / arrange the
+// scan," so they share one "Layout ▾" toolbar dropdown instead of two separate
+// always-visible rows of segmented buttons.
+const VIEW_MODE_OPTIONS: { mode: ViewMode; label: string }[] = [
+	{ mode: "mpr", label: "⊞ MPR" },
+	{ mode: "axial", label: "Axial" },
+	{ mode: "sagittal", label: "Sag" },
+	{ mode: "coronal", label: "Cor" },
+	{ mode: "3d", label: "3D" },
+];
+const VIEW_MODE_SHORT_LABEL: Record<ViewMode, string> = {
+	mpr: "MPR",
+	axial: "Axial",
+	sagittal: "Sagittal",
+	coronal: "Coronal",
+	"3d": "3D",
+};
+
+// Case metadata fields pulled from PanTS/metadata.xlsx (via /api/search), in display
+// order — a curated subset of row_to_item's fields; spacing_sum/shape_sum/complete are
+// internal sort helpers, not meaningful to show a reader.
+const METADATA_FIELDS: { key: string; label: string }[] = [
+	{ key: "PanTS ID", label: "PanTS ID" },
+	{ key: "sex", label: "Sex" },
+	{ key: "age", label: "Age" },
+	{ key: "tumor", label: "Tumor" },
+	{ key: "ct phase", label: "CT Phase" },
+	{ key: "manufacturer", label: "Manufacturer" },
+	{ key: "manufacturer model", label: "Scanner Model" },
+	{ key: "study year", label: "Study Year" },
+	{ key: "study type", label: "Study Type" },
+	{ key: "site nationality", label: "Site" },
+];
+
+const formatMetaValue = (key: string, v: unknown): string => {
+	if (key === "tumor") {
+		if (v === 1 || v === true) return "Yes";
+		if (v === 0 || v === false) return "No";
+		return "Unknown";
+	}
+	if (v === null || v === undefined || v === "") return "—";
+	if (typeof v === "number") return Number.isInteger(v) ? String(v) : v.toFixed(1);
+	return String(v);
+};
+
+type OrganStat = OrganMetric;
+
+// Formats a nullable metric for the organ-stats detail drawer — "—" when the backend
+// didn't compute it (e.g. an empty/degenerate mask), fixed-point otherwise.
+const fmtStat = (v: number | null, digits = 0): string => (v === null ? "—" : v.toFixed(digits));
+
+// Cornerstone's segmentation Color is [r, g, b, a] on a 0–255 scale; CSS wants alpha 0–1.
+// Falls back to a neutral gray if a label has no LUT entry (shouldn't happen in practice).
+const colorToCss = (c: Color | undefined): string =>
+	c ? `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] ?? 255) / 255})` : "rgba(255, 255, 255, 0.4)";
 
 const CT_PRESETS = [
 	{ name: "Soft Tissue", width: 400, center: 40 },
@@ -130,18 +224,68 @@ const CT_PRESETS = [
 	{ name: "Angio", width: 600, center: 150 }, // contrast-enhanced vessels (CTA)
 ] as const;
 
-// Measurement tools shown inside the collapsible "Measure" flyout, so the toolbar isn't
-// crowded with one button per tool (matches the split-button pattern OHIF uses).
-// `key` is the keyboard shortcut (also shown in the flyout).
-const MEASURE_TOOLS: { name: MeasurementToolName; label: string; Icon: typeof IconRuler2; key: string }[] = [
+// Measurement tools (+ the magnify loupe, which shares the same primary-mouse-tool slot)
+// shown inside the collapsible "Measure" flyout, so the toolbar isn't crowded with one
+// button per tool (matches the split-button pattern OHIF uses). `key` is the keyboard
+// shortcut (also shown in the flyout). Typed by PrimaryMouseToolName (not the narrower
+// MeasurementToolName) so the magnify entry — a plain `string`, deliberately not part of
+// the measurement-tool union — fits in the same array.
+const MEASURE_TOOLS: { name: PrimaryMouseToolName; label: string; Icon: typeof IconRuler2; key: string }[] = [
 	{ name: LENGTH_TOOL, label: "Distance (mm)", Icon: IconRuler2, key: "L" },
 	{ name: BIDIRECTIONAL_TOOL, label: "Bidirectional · long × short axis", Icon: IconArrowsCross, key: "B" },
 	{ name: ANGLE_TOOL, label: "Angle (°)", Icon: IconAngle, key: "A" },
 	{ name: PROBE_TOOL, label: "HU at point", Icon: IconClick, key: "P" },
 	{ name: ROI_TOOL, label: "Rect ROI · HU & area", Icon: IconSquareDashed, key: "R" },
 	{ name: ELLIPSE_TOOL, label: "Ellipse ROI · HU & area", Icon: IconCircle, key: "E" },
+	{ name: FREEHAND_ROI_TOOL, label: "Freehand ROI · HU & area", Icon: IconLasso, key: "F" },
 	{ name: ARROW_TOOL, label: "Arrow · label a finding", Icon: IconArrowUpRight, key: "T" },
+	{ name: MAGNIFY_TOOL, label: "Magnify loupe", Icon: IconZoomIn, key: "G" },
 ];
+
+// One flyout group's transient UI state: whether it's open, where its portal-rendered
+// panel sits (measured off the trigger button on open), and the refs the outside-
+// click/reflow handler needs. Used for every toolbar dropdown (Measure, View, Cine,
+// Edit, Capture, Panels, Report) so that logic — open/close, position, dismiss-on-
+// outside-click-or-scroll — isn't hand-duplicated per group.
+function useToolbarFlyout() {
+	const [open, setOpen] = useState(false);
+	const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+	const groupRef = useRef<HTMLDivElement>(null);
+	const btnRef = useRef<HTMLButtonElement>(null);
+	const menuRef = useRef<HTMLDivElement>(null);
+
+	const toggle = () => {
+		setOpen((prev) => {
+			const next = !prev;
+			if (next && btnRef.current) {
+				const r = btnRef.current.getBoundingClientRect();
+				setPos({ top: r.bottom + 8, left: r.left });
+			}
+			return next;
+		});
+	};
+	const close = () => setOpen(false);
+
+	useEffect(() => {
+		if (!open) return;
+		const onPointerDown = (e: globalThis.MouseEvent) => {
+			const t = e.target as Node;
+			if (groupRef.current?.contains(t) || menuRef.current?.contains(t)) return;
+			setOpen(false);
+		};
+		const onReflow = () => setOpen(false);
+		document.addEventListener("mousedown", onPointerDown);
+		window.addEventListener("scroll", onReflow, true);
+		window.addEventListener("resize", onReflow);
+		return () => {
+			document.removeEventListener("mousedown", onPointerDown);
+			window.removeEventListener("scroll", onReflow, true);
+			window.removeEventListener("resize", onReflow);
+		};
+	}, [open]);
+
+	return { open, pos, groupRef, btnRef, menuRef, toggle, close };
+}
 
 function VisualizationPage() {
 	// References and state
@@ -180,8 +324,8 @@ function VisualizationPage() {
 			}
 			const id = pantsCase ?? "1";
 			const p = getPanTSId(id);
-			const localCt = `${API_BASE}/api/get-main-nifti/${id}`;
-			const localSeg = `${API_BASE}/api/get-segmentations/${id}`;
+			const localCt = `${API_BASE}/api/get-main-nifti/${id}.nii.gz`;
+			const localSeg = `${API_BASE}/api/get-segmentations/${id}.nii.gz`;
 			const hfCt = `https://huggingface.co/datasets/BodyMaps/iPanTSMini/resolve/main/image_only/${p}/ct.nii.gz?download=true`;
 			const hfSeg = `https://huggingface.co/datasets/BodyMaps/iPanTSMini/resolve/main/mask_only/${p}/combined_labels.nii.gz?download=true`;
 			// HEAD probe: fast, doesn't download the volume; 404/500 → use HF fallback.
@@ -220,17 +364,34 @@ function VisualizationPage() {
 	const preIsolateCheckStateRef = useRef<boolean[] | null>(null);
 	//const [isolatedOrgan, setIsolatedOrgan] = useState<string | null>(null);
 
-	//   const [sliceAxial, setSliceAxial] = useState(0);
-	//   const [sliceSagittal, setSliceSagittal] = useState(0);
-	//   const [sliceCoronal, setSliceCoronal] = useState(0);
 	const [checkState, setCheckState] = useState<boolean[]>([true]);
 	const [NV, _setNV] = useState<Niivue | undefined>();
 	const [checkBoxData, setCheckBoxData] = useState<CheckBoxData[]>([]);
+	// Fill (solid color wash) and outline (border) opacity are independent sliders — see
+	// setFillOpacity/setOutlineOpacity. Outline defaults to 0 (off), matching how the mask
+	// looked before this split existed (borders were never actually rendered).
 	const [opacityValue, setOpacityValue] = useState(
 		APP_CONSTANTS.DEFAULT_SEGMENTATION_OPACITY * 100
 	);
+	const [outlineOpacityValue, setOutlineOpacityValue] = useState(0);
+	// Current/total slice per MPR pane, for the "245/519" caption + drag scrollbar.
+	// Populated by subscribeToSliceChanges once the volume is ready; null until then.
+	const [sliceInfo, setSliceInfo] = useState<Record<CinePane, SliceInfo | null>>({
+		axial: null,
+		sagittal: null,
+		coronal: null,
+	});
+	// Matches the "Soft Tissue" CT_PRESETS entry (W 400 / L 40) — activePreset below
+	// defaults to that same preset, so the readout and the pre-highlighted button
+	// should agree on first load instead of showing a level the preset never set.
 	const [windowWidth, setWindowWidth] = useState(400);
-	const [windowCenter, setWindowCenter] = useState(50);
+	const [windowCenter, setWindowCenter] = useState(40);
+	// Brief W/L readout: shown only while the user is actively dragging the brightness/
+	// contrast sliders or picking a preset — not on the initial/deep-link window apply, and
+	// not left on screen indefinitely. windowReadoutTimerRef holds the fade-out timeout so
+	// each new change can restart it instead of stacking timers.
+	const [windowReadoutVisible, setWindowReadoutVisible] = useState(false);
+	const windowReadoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const [renderingEngine, setRenderingEngine] =
 		useState<RenderingEngine | null>(null);
 	const [viewportIds, setViewportIds] = useState<string[]>([]);
@@ -241,12 +402,22 @@ function VisualizationPage() {
 	const [organStats, setOrganStats] = useState<OrganStat[] | null>(null);
 	const [statsLoading, setStatsLoading] = useState(false);
 	const [statsError, setStatsError] = useState(false);
+	// Row index of the organ whose full metric breakdown (median/std dev/skew/kurtosis/...)
+	// is expanded inline. Only one at a time — keeps the panel compact by default.
+	const [expandedStatRow, setExpandedStatRow] = useState<number | null>(null);
 	// Population reference + this case's demographics, used to show each organ's volume
 	// percentile vs the dataset. Both are optional — if the norms asset is missing (e.g. a
 	// dev checkout) or the case has no metadata, the panel just omits the percentile column.
 	const [organNorms, setOrganNorms] = useState<OrganNorms | null>(null);
 	const [demographics, setDemographics] = useState<{ sex: string | null; age: number | null } | null>(null);
 	const normsTried = useRef(false);
+	// Case metadata panel (PanTS/metadata.xlsx, via the same /api/search lookup that
+	// already supplies demographics). demographicsTriedRef guards the fetch so it only
+	// ever runs once per case, even if no matching row is found (in which case
+	// caseMetadata stays null and the panel shows its "not available" state).
+	const [showMetadata, setShowMetadata] = useState(false);
+	const [caseMetadata, setCaseMetadata] = useState<Record<string, unknown> | null>(null);
+	const demographicsTriedRef = useRef(false);
 	// Measured download progress for the loading screen (from the nifti loader's real
 	// bytes-loaded/total — accurate, not a guess).
 	const [dlPct, setDlPct] = useState<number | null>(null);
@@ -266,11 +437,28 @@ function VisualizationPage() {
 	);
 	const [zoomLevel, setZoomLevel] = useState(1);
 	const [crosshairToolActive, setCrosshairToolActive] = useState(true);
+	// OHIF-style reference lines: unlike the crosshair's own intersection lines (which only
+	// show while Crosshairs is the active navigation tool), this is a passive overlay that
+	// keeps showing where the pane being scrolled cuts the other two, regardless of which
+	// tool currently owns the mouse. Only one pane is ever the "source" at a time — a plain
+	// toggle for on/off. The imperative apply happens in the effect below, which also
+	// re-applies after any volume reload (a fresh tool group always starts with every tool
+	// disabled).
+	const [referenceLinesOn, setReferenceLinesOn] = useState(false);
+	// The pane the user most recently scrolled or clicked into — "whichever axis is in
+	// focus" for every single-pane tool (reference lines' source, cine, flip, rotate). A
+	// ref, not state: a wheel tick shouldn't force a re-render, and reading .current at
+	// call time is always fresh regardless of when the enclosing closure was created.
+	const activePaneRef = useRef<CinePane>("axial");
 	// Which measurement tool (or the magnify loupe) owns the primary mouse button
 	// (null = navigation/crosshair).
 	const [activeMeasureTool, setActiveMeasureTool] = useState<PrimaryMouseToolName | null>(null);
-	// Cine playback: auto-scroll the current pane through its slices.
+	// Cine playback: auto-scroll the current pane through its slices. The FPS slider is
+	// always visible next to the play button (not just once playing) so the speed can be
+	// dialed in before hitting play; changing it while already playing restarts the clip
+	// at the new rate instead of waiting for a stop/start.
 	const [cinePlaying, setCinePlaying] = useState(false);
+	const [cineFps, setCineFps] = useState(12);
 	// Mask editing: right-side panel + which brush (paint/erase) owns the mouse.
 	const [showEditPanel, setShowEditPanel] = useState(false);
 	const [editMode, setEditMode] = useState<MaskEditMode>(null);
@@ -294,25 +482,18 @@ function VisualizationPage() {
 	const [volume3DPresets, setVolume3DPresets] = useState<readonly { name: string; label: string }[]>(VOLUME_3D_PRESETS);
 	const [volume3DFailed, setVolume3DFailed] = useState(false);
 	const volume3DRef = useRef<HTMLDivElement>(null);
-	// Collapsible measurement-tools flyout (declutters the toolbar). The menu renders in a
-	// portal at a fixed position so it isn't clipped by the scrollable settings panel.
-	const [measureMenuOpen, setMeasureMenuOpen] = useState(false);
-	const [measureMenuPos, setMeasureMenuPos] = useState<{ top: number; left: number } | null>(null);
-	const measureGroupRef = useRef<HTMLDivElement>(null);
-	const measureBtnRef = useRef<HTMLButtonElement>(null);
-	const measureMenuRef = useRef<HTMLDivElement>(null);
+	// Toolbar flyout groups — each declutters a cluster of related buttons behind one
+	// icon + dropdown (same portal-at-fixed-position pattern, so none of them get
+	// clipped by the scrollable toolbar). See useToolbarFlyout.
+	const layoutFlyout = useToolbarFlyout(); // view mode + pane layout preset (stays open — a config panel)
+	const windowFlyout = useToolbarFlyout(); // CT window presets (stays open — a config panel)
+	const adjustFlyout = useToolbarFlyout(); // fill/border/brightness/contrast/zoom sliders + center/reset (stays open)
+	const measureFlyout = useToolbarFlyout(); // measurement tools + magnify loupe
+	const viewFlyout = useToolbarFlyout(); // hover-identify, reference lines, flip, rotate
+	const cineFlyout = useToolbarFlyout(); // play/pause + FPS (stays open — a live mini-panel, not a pick-and-dismiss menu)
+	const captureFlyout = useToolbarFlyout(); // snapshot, reading session, share link
+	const panelsFlyout = useToolbarFlyout(); // organs, organ stats, case metadata, measurements list
 
-	const toggleMeasureMenu = () => {
-		setMeasureMenuOpen((open) => {
-			const next = !open;
-			if (next && measureBtnRef.current) {
-				// Open the flyout just below the toolbar button.
-				const r = measureBtnRef.current.getBoundingClientRect();
-				setMeasureMenuPos({ top: r.bottom + 8, left: r.left });
-			}
-			return next;
-		});
-	};
 	// Reading session (voice-assisted case review). The ref mirrors the state so event
 	// handlers and Cornerstone subscriptions can log without re-subscribing on start/stop.
 	const sessionRef = useRef<ReadingSession | null>(null);
@@ -326,12 +507,24 @@ function VisualizationPage() {
 	const [shareCopied, setShareCopied] = useState(false);
 	const shareStateAppliedRef = useRef(false);
 	const [viewMode, setViewMode] = useState<ViewMode>("mpr");
+	// Which pane gets the lion's share of the grid while in "mpr" view — no-op in the
+	// single-view / 3d-fullscreen modes, which already give one pane 100% of the stage.
+	const [layoutPreset, setLayoutPreset] = useState<LayoutPreset>("grid");
 	const [activePreset, setActivePreset] = useState<string>("Soft Tissue");
 	const [_tooltip, setToolTip] = useState({
 		visible: false,
 		x: 0,
 		y: 0,
 		text: "",
+	});
+
+	const [hoverIdentifyEnabled, setHoverIdentifyEnabled] = useState(false);
+	const [hoverOrganTip, setHoverOrganTip] = useState({
+		visible: false,
+		x: 0,
+		y: 0,
+		text: "",
+		color: "transparent",
 	});
 
 	// const location = useLocation();
@@ -352,26 +545,6 @@ function VisualizationPage() {
 			toggleCrosshairTool(crosshairToolActive);
 		}
 	}, [editMode, activeMeasureTool, crosshairToolActive]);
-
-	// Close the measurement flyout on an outside click, or when the panel scrolls/resizes
-	// (the portal menu is fixed-positioned, so it would otherwise detach from the button).
-	useEffect(() => {
-		if (!measureMenuOpen) return;
-		const onPointerDown = (e: globalThis.MouseEvent) => {
-			const t = e.target as Node;
-			if (measureGroupRef.current?.contains(t) || measureMenuRef.current?.contains(t)) return;
-			setMeasureMenuOpen(false);
-		};
-		const onReflow = () => setMeasureMenuOpen(false);
-		document.addEventListener("mousedown", onPointerDown);
-		window.addEventListener("scroll", onReflow, true);
-		window.addEventListener("resize", onReflow);
-		return () => {
-			document.removeEventListener("mousedown", onPointerDown);
-			window.removeEventListener("scroll", onReflow, true);
-			window.removeEventListener("resize", onReflow);
-		};
-	}, [measureMenuOpen]);
 
 	useEffect(() => {
 		const unsubscribe = subscribeToCrosshairChanges((mm) => {
@@ -473,24 +646,60 @@ function VisualizationPage() {
 		return unsubscribe;
 	}, [takeSnapshot]);
 
-	// ---- Cine playback ------------------------------------------------------------
+	// ---- Cine playback / flip / rotate — all act on the "focused" pane -------------
 
-	// The pane cine scrolls: the fullscreen 2D pane when in a single view, else axial.
-	const cinePane: CinePane =
-		viewMode === "sagittal" || viewMode === "coronal" ? viewMode : "axial";
+	// The fullscreen 2D pane when in a single view (unambiguous — only one is on
+	// screen), else whichever of the three MPR panes was most recently scrolled/clicked
+	// (activePaneRef), defaulting to axial until the user interacts with a pane at all.
+	// Recomputed fresh on every call — cheap, and guarantees flip/rotate (single-click
+	// actions with no intervening re-render) never act on a stale pane.
+	const getFocusedPane = (): CinePane =>
+		viewMode === "axial" || viewMode === "sagittal" || viewMode === "coronal"
+			? viewMode
+			: activePaneRef.current;
+	const cinePane: CinePane = getFocusedPane();
 
+	const handleFlipHorizontal = () => {
+		const pane = getFocusedPane();
+		flipPaneHorizontal(pane);
+		sessionRef.current?.log("view", `Flipped ${pane} horizontally`);
+	};
+
+	const handleRotate90Clockwise = () => {
+		const pane = getFocusedPane();
+		rotatePane90Clockwise(pane);
+		sessionRef.current?.log("view", `Rotated ${pane} 90° clockwise`);
+	};
+
+	// Reads cinePlaying directly rather than through setState's functional-updater form —
+	// React StrictMode double-invokes that form in dev to catch impure updaters, which would
+	// call startCine/stopCine twice per click (this app runs in StrictMode; see the similar
+	// double-run workarounds in dicomLocal.ts).
 	const toggleCine = useCallback(() => {
-		setCinePlaying((playing) => {
-			if (playing) {
-				stopCine();
-				sessionRef.current?.log("view", "Stopped cine playback");
-				return false;
-			}
-			const ok = startCine(cinePane);
-			if (ok) sessionRef.current?.log("view", `Started cine playback (${cinePane})`);
-			return ok;
-		});
-	}, [cinePane]);
+		if (cinePlaying) {
+			stopCine();
+			setCinePlaying(false);
+			sessionRef.current?.log("view", "Stopped cine playback");
+			return;
+		}
+		const ok = startCine(cinePane, cineFps);
+		setCinePlaying(ok);
+		if (ok) {
+			sessionRef.current?.log("view", `Started cine playback (${cinePane}, ${cineFps} fps)`);
+		} else {
+			console.warn(`Cine playback failed to start for pane "${cinePane}"`);
+		}
+	}, [cinePlaying, cinePane, cineFps]);
+
+	// Live-adjust the frame rate: if a clip is already running, restart it immediately at
+	// the new speed rather than waiting for the next stop/start.
+	const handleCineFpsChange = (fps: number) => {
+		setCineFps(fps);
+		if (cinePlaying) {
+			stopCine();
+			startCine(cinePane, fps);
+		}
+	};
 
 	// Changing the layout invalidates the playing pane; stop rather than guess. Also
 	// stop on unmount so the interval doesn't outlive the viewports.
@@ -499,6 +708,9 @@ function VisualizationPage() {
 		setCinePlaying(false);
 	}, [viewMode]);
 	useEffect(() => () => stopCine(), []);
+	useEffect(() => () => {
+		if (windowReadoutTimerRef.current) clearTimeout(windowReadoutTimerRef.current);
+	}, []);
 
 	// Keyboard shortcuts (skipped while typing): L/B/A/P/R/E/T measurement tools,
 	// G magnify, C crosshair, S snapshot, M measurements panel, V cine,
@@ -526,6 +738,7 @@ function VisualizationPage() {
 				p: PROBE_TOOL,
 				r: ROI_TOOL,
 				e: ELLIPSE_TOOL,
+				f: FREEHAND_ROI_TOOL,
 				t: ARROW_TOOL,
 				g: MAGNIFY_TOOL,
 			};
@@ -542,6 +755,7 @@ function VisualizationPage() {
 				toggleCine();
 			} else if (key === "m") {
 				setShowStats(false);
+				setShowMetadata(false);
 				setShowEditPanel(false);
 				setEditMode(null);
 				setShowMeasurePanel((v) => !v);
@@ -579,7 +793,7 @@ function VisualizationPage() {
 			}
 		});
 		try {
-			const newVolumeId = await upgradeCtVolume(`${API_BASE}/api/get-main-nifti/${pantsCase}`);
+			const newVolumeId = await upgradeCtVolume(`${API_BASE}/api/get-main-nifti/${pantsCase}.nii.gz`);
 			if (!newVolumeId) {
 				setEnhance({ state: "failed", pct: null });
 				return;
@@ -883,6 +1097,44 @@ function VisualizationPage() {
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [renderingEngine, viewportIds, volumeId]);
 
+	// Track each pane's current/total slice for the "245/519" caption + drag scrollbar.
+	// Re-subscribes on every volume (re)load, since a fresh render tears down the old
+	// viewport elements the previous subscription's listeners were attached to.
+	useEffect(() => {
+		if (!renderingEngine || !viewportIds.length || !volumeId) return;
+		const unsubscribe = subscribeToSliceChanges((pane, info) => {
+			setSliceInfo((prev) => (prev[pane]?.current === info.current && prev[pane]?.total === info.total
+				? prev
+				: { ...prev, [pane]: info }));
+		});
+		return unsubscribe;
+	}, [renderingEngine, viewportIds, volumeId]);
+
+	// Apply the reference-lines toggle once the engine/viewports/volume are ready, and
+	// re-apply on both a user toggle and a volume reload (a fresh tool group always starts
+	// with every tool disabled).
+	useEffect(() => {
+		if (renderingEngine && viewportIds.length && volumeId) {
+			setReferenceLinesEnabled(referenceLinesOn, activePaneRef.current);
+		}
+	}, [referenceLinesOn, renderingEngine, viewportIds, volumeId]);
+
+	// Wheel-scrolling or clicking a pane makes it "focused" — the reference-lines source,
+	// and the target for cine/flip/rotate. No-ops the reference-lines re-apply while that
+	// tool is off; the ref update itself is cheap enough to run unconditionally.
+	// Guarded on the pane actually changing: a wheel gesture fires this once per slice
+	// (dozens of times while scrolling through the SAME pane), and re-running
+	// setReferenceLinesEnabled on every tick — a full disable/enable + re-render of all
+	// three viewports — for a source that hasn't changed was visible as the dotted lines
+	// flickering off and back on during a normal scroll.
+	const handlePaneFocus = (pane: CinePane) => {
+		const paneChanged = activePaneRef.current !== pane;
+		activePaneRef.current = pane;
+		if (referenceLinesOn && paneChanged) setReferenceLinesEnabled(true, pane);
+	};
+	const handlePaneWheel = (pane: CinePane) => () => handlePaneFocus(pane);
+	const handlePaneMouseDown = (pane: CinePane) => () => handlePaneFocus(pane);
+
 	// Apply a shared deep-link's view state once the volume is ready (orientation, window,
 	// opacity, hidden organs, crosshair). Runs a single time — after that the URL is just a
 	// snapshot and the user is free to change things.
@@ -896,7 +1148,7 @@ function VisualizationPage() {
 		if (shared.ww != null && shared.wc != null) handleWindowChange(shared.ww, shared.wc);
 		if (shared.opacity != null) {
 			setOpacityValue(shared.opacity);
-			setToolGroupOpacity(shared.opacity / 100);
+			setFillOpacity(shared.opacity / 100);
 		}
 		if (shared.hidden?.length) {
 			// The checkState effect below applies the visibility change (Cornerstone + NiiVue).
@@ -942,10 +1194,22 @@ function VisualizationPage() {
 		window.setTimeout(() => setShareCopied(false), 1600);
 	};
 
-	// The Measure button shows the active tool's icon (or the ruler when none is active).
-	// Magnify shares the activation state but has its own button, so it doesn't count here.
-	const measureToolActive = activeMeasureTool !== null && activeMeasureTool !== MAGNIFY_TOOL;
+	// The Measure button shows the active tool's icon (including magnify, now folded into
+	// the same flyout/state), or the ruler when nothing is active.
+	const measureToolActive = activeMeasureTool !== null;
 	const ActiveMeasureIcon = MEASURE_TOOLS.find((t) => t.name === activeMeasureTool)?.Icon ?? IconRuler2;
+
+	// Group-level "something inside is active" flags, so each collapsed toolbar dropdown
+	// still visually reflects its contents' state without having to be open.
+	const viewGroupActive = hoverIdentifyEnabled || referenceLinesOn;
+	const panelsGroupActive = showOrganDetails || showStats || showMetadata || showMeasurePanel;
+
+	// The Layout ▾ trigger shows the pane-layout preset's name when one is active
+	// (it's the more specific choice), otherwise the current view mode.
+	const layoutTriggerLabel =
+		viewMode === "mpr" && layoutPreset !== "grid"
+			? LAYOUT_PRESETS.find((p) => p.id === layoutPreset)?.label ?? VIEW_MODE_SHORT_LABEL.mpr
+			: VIEW_MODE_SHORT_LABEL[viewMode];
 
 	// Center on an organ (from the sidebar): move both the 2D MPR crosshair and the 3D
 	// (NiiVue) crosshair — the Cornerstone move suppresses its change event, so the 3D
@@ -1042,7 +1306,7 @@ function VisualizationPage() {
 			cancelAnimationFrame(raf1);
 			cancelAnimationFrame(raf2);
 		};
-	}, [viewMode, renderingEngine, NV, viewportIds]);
+	}, [viewMode, layoutPreset, renderingEngine, NV, viewportIds]);
 
 	// Apply zoom to the Cornerstone viewports whenever the toolbar slider changes.
 	// (Previously ZoomHandle owned this side effect; the slider now lives in the toolbar.)
@@ -1069,7 +1333,17 @@ function VisualizationPage() {
 	const handlePresetClick = (preset: typeof CT_PRESETS[number]) => {
 		setActivePreset(preset.name);
 		handleWindowChange(preset.width, preset.center);
+		showWindowReadoutBriefly();
 		sessionRef.current?.log("preset", `Applied ${preset.name} window`);
+	};
+
+	// Shows the W/L readout and (re)starts its fade-out timer. Called only from actual
+	// user interaction (brightness/contrast sliders, presets) — not from the initial-load
+	// or deep-link window apply, which shouldn't pop the readout unprompted.
+	const showWindowReadoutBriefly = () => {
+		setWindowReadoutVisible(true);
+		if (windowReadoutTimerRef.current) clearTimeout(windowReadoutTimerRef.current);
+		windowReadoutTimerRef.current = setTimeout(() => setWindowReadoutVisible(false), 2000);
 	};
 
 	const panelStyle = (panel: "axial" | "sagittal" | "coronal" | "3d"): React.CSSProperties => {
@@ -1083,6 +1357,52 @@ function VisualizationPage() {
 		}
 		// 2D single view: collapse the grid to one cell and hide the rest.
 		return viewMode === panel ? {} : { display: "none" };
+	};
+
+	// Grid placement for the asymmetric layout presets (see LAYOUT_PRESETS): the primary
+	// pane spans a wide first column across all 3 rows, the other three stack down a
+	// narrow second column in a fixed order. No-op outside "mpr" — the other view modes
+	// already give a single pane the whole stage via panelStyle above — and for the
+	// default "grid" preset, which just falls back to the plain 2×2 CSS grid.
+	const paneGridStyle = (panel: ViewMode): React.CSSProperties => {
+		if (viewMode !== "mpr" || layoutPreset === "grid") return {};
+		const primary = LAYOUT_PRESET_PRIMARY[layoutPreset];
+		if (panel === primary) return { gridColumn: "1", gridRow: "1 / span 3" };
+		const secondaries = LAYOUT_PANE_ORDER.filter((p) => p !== primary);
+		return { gridColumn: "2", gridRow: `${secondaries.indexOf(panel) + 1}` };
+	};
+
+	// Overlay UI for one MPR pane: the slice drag-scrollbar + "245/519" caption (bottom
+	// right, only once slice info has arrived for that pane), and the W/L readout (bottom
+	// left, only while showWindowReadoutBriefly's fade timer hasn't expired). Rendered as
+	// siblings of the Cornerstone-owned pane div, inside the shared .vp-pane-wrap — never
+	// as children of that div itself, since Cornerstone manages its children imperatively
+	// and mixing React-rendered children into the same node risks the two fighting over
+	// the same DOM nodes.
+	const renderPaneOverlays = (pane: CinePane) => {
+		const info = sliceInfo[pane];
+		return (
+			<>
+				{info && info.total > 1 && (
+					<>
+						<input
+							type="range"
+							className="vp-slice-scrollbar"
+							min={0}
+							max={info.total - 1}
+							step={1}
+							value={info.current}
+							onChange={(e) => setPaneSliceIndex(pane, Number(e.target.value))}
+							aria-label={`${pane} slice`}
+						/>
+						<div className="vp-slice-caption">{info.current + 1}/{info.total}</div>
+					</>
+				)}
+				<div className={`vp-window-readout${windowReadoutVisible ? " vp-window-readout--visible" : ""}`}>
+					W {Math.round(windowWidth)} · L {Math.round(windowCenter)}
+				</div>
+			</>
+		);
 	};
 
 	// Update segmentation visibility when state changes
@@ -1113,9 +1433,17 @@ function VisualizationPage() {
 	) => {
 		const value = Number(event.target.value);
 		setOpacityValue(value);
-		setToolGroupOpacity(value / 100);
-		sessionRef.current?.log("opacity", `Mask opacity set to ${value}%`, 1200);
-		// updateGeneralOpacity(render_ref, value / 100);
+		setFillOpacity(value / 100);
+		sessionRef.current?.log("opacity", `Fill opacity set to ${value}%`, 1200);
+	};
+
+	const handleOutlineOpacityChange = (
+		event: React.ChangeEvent<HTMLInputElement>
+	) => {
+		const value = Number(event.target.value);
+		setOutlineOpacityValue(value);
+		setOutlineOpacity(value / 100);
+		sessionRef.current?.log("opacity", `Border opacity set to ${value}%`, 1200);
 	};
 
 
@@ -1143,18 +1471,22 @@ function VisualizationPage() {
 		}
 	};
 
-	// Load the population norms (static asset) + this case's demographics so the panel can
-	// show each organ's volume percentile. Both fail soft: no norms or no metadata simply
-	// means the percentile column is omitted. Runs once.
+	// Load the population norms (static asset) + this case's full metadata row (sex/age
+	// for the percentile panel, plus the rest for the case-metadata panel). Both fail
+	// soft: no norms or no metadata row simply means those panels omit that data.
+	// demographicsTriedRef (not "!demographics", which a case with no matching row would
+	// never satisfy) guards the fetch so a missing row is only looked up once, not on
+	// every panel open.
 	const loadPercentileContext = async () => {
 		if (!normsTried.current) {
 			normsTried.current = true;
 			const norms = await loadOrganNorms();
 			if (norms) setOrganNorms(norms);
 		}
-		// Only dataset cases carry sex/age in the metadata; reuse the existing search
-		// endpoint (exact case-id match) rather than adding a per-case metadata route.
-		if (!demographics && pantsCase) {
+		// Only dataset cases carry metadata; reuse the existing search endpoint (exact
+		// case-id match) rather than adding a per-case metadata route.
+		if (!demographicsTriedRef.current && pantsCase) {
+			demographicsTriedRef.current = true;
 			try {
 				const res = await fetch(
 					`${API_BASE}/api/search?caseid=${encodeURIComponent(pantsCase)}&per_page=1`
@@ -1173,20 +1505,31 @@ function VisualizationPage() {
 						sex: item.sex ?? null,
 						age: Number.isFinite(ageNum) ? ageNum : null,
 					});
+					setCaseMetadata(item);
 				}
 			} catch {
-				/* percentile just falls back to the whole-dataset bucket */
+				/* percentile/metadata panels just fall back to their "not available" state */
 			}
 		}
 	};
 
 	const handleToggleStats = () => {
-		// The right-side slot is shared by stats / measurements / mask editing.
+		// The right-side slot is shared by stats / metadata / measurements / mask editing.
+		setShowMetadata(false);
 		setShowMeasurePanel(false);
 		setShowEditPanel(false);
 		setEditMode(null);
 		setShowStats((v) => !v);
 		loadOrganStats();
+		loadPercentileContext();
+	};
+
+	const handleToggleMetadata = () => {
+		setShowStats(false);
+		setShowMeasurePanel(false);
+		setShowEditPanel(false);
+		setEditMode(null);
+		setShowMetadata((v) => !v);
 		loadPercentileContext();
 	};
 
@@ -1248,6 +1591,32 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 		});
 	};
 
+	// Mousemove handler for the "hover to identify" tool — resolves the organ under the
+	// cursor for one specific pane (via canvasToWorld, not the crosshair) and floats a
+	// tooltip next to the pointer. No-ops entirely while the tool is off.
+	const handlePaneHover = (pane: CinePane) => (e: MouseEvent) => {
+		if (!hoverIdentifyEnabled) return;
+		const idx = getOrganLabelAtPoint(pane, e.clientX, e.clientY);
+		if (!idx) {
+			setHoverOrganTip((t) => (t.visible ? { ...t, visible: false } : t));
+			return;
+		}
+		const rawLabel = segmentation_categories[idx - 1];
+		setHoverOrganTip({
+			visible: true,
+			x: e.clientX + 14,
+			y: e.clientY + 14,
+			text: rawLabel ? filenameToName(rawLabel) : "Unknown",
+			// Same LUT the mask overlay is rendered with, so the swatch/border always
+			// matches the color the organ is actually painted in the pane.
+			color: colorToCss(labelColorMap[idx]),
+		});
+	};
+
+	const handlePaneHoverLeave = () => {
+		setHoverOrganTip((t) => (t.visible ? { ...t, visible: false } : t));
+	};
+
 	const navBack = () => {
 		window.location.href = "/dashboard";
 	};
@@ -1301,98 +1670,210 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 
 					<span className="vp-tb-divider" />
 
-					{/* View layout */}
-					<div className="vp-seg vp-tb-seg" role="group" aria-label="View layout">
-						{([
-							{ mode: "mpr" as ViewMode, label: "⊞ MPR" },
-							{ mode: "axial" as ViewMode, label: "Axial" },
-							{ mode: "sagittal" as ViewMode, label: "Sag" },
-							{ mode: "coronal" as ViewMode, label: "Cor" },
-							{ mode: "3d" as ViewMode, label: "3D" },
-						]).map(({ mode, label }) => (
-							<button
-								key={mode}
-								onClick={() => setViewMode(mode)}
-								className={`vp-seg__btn ${viewMode === mode ? "vp-seg__btn--active" : ""}`}
-							>{label}</button>
-						))}
-					</div>
-
-					<span className="vp-tb-divider" />
-
-					{/* CT window presets */}
-					<div className="vp-seg vp-tb-seg" role="group" aria-label="CT window presets">
-						{CT_PRESETS.map((preset) => (
-							<button
-								key={preset.name}
-								onClick={() => handlePresetClick(preset)}
-								className={`vp-seg__btn ${activePreset === preset.name ? "vp-seg__btn--active" : ""}`}
-							>{preset.name}</button>
-						))}
-					</div>
-
-					<span className="vp-tb-divider" />
-
-					{/* Compact adjustments: opacity, brightness, contrast, zoom */}
-					<div className="vp-tb-adjust">
-						{!isDicom && (
-							<label className="vp-tb-slider" title="Mask opacity">
-								<span className="vp-tb-slider__label">Opac</span>
-								<input
-									type="range" min="0" max="100" step="1" className="vp-range"
-									aria-label="Label opacity"
-									value={opacityValue}
-									onChange={handleOpacityOnSliderChange}
-								/>
-								<span className="vp-tb-slider__val">{Math.round(opacityValue)}%</span>
-							</label>
-						)}
-						<label className="vp-tb-slider" title="Brightness (window level)">
-							<span className="vp-tb-slider__label">Brt</span>
-							<input
-								type="range" min="-1000" max="1000" step="1" className="vp-range"
-								aria-label="Brightness"
-								value={windowCenter * -1}
-								onChange={(e) => handleWindowChange(null, Number(e.target.value) * -1)}
-							/>
-						</label>
-						<label className="vp-tb-slider" title="Contrast (window width)">
-							<span className="vp-tb-slider__label">Con</span>
-							<input
-								type="range" min="1" max="2000" step="1" className="vp-range"
-								aria-label="Contrast"
-								value={windowWidth}
-								onChange={(e) => handleWindowChange(Number(e.target.value), null)}
-							/>
-						</label>
-						<label className="vp-tb-slider" title="Zoom">
-							<span className="vp-tb-slider__label">Zoom</span>
-							<input
-								type="range" min="0.5" max="2" step="0.05" className="vp-range"
-								aria-label="Zoom"
-								value={zoomLevel}
-								onChange={(e) => setZoomLevel(Number(e.target.value))}
-							/>
-							<span className="vp-tb-slider__val">{zoomLevel.toFixed(1)}×</span>
-						</label>
-						<button className="vp-tb-mini" onClick={() => centerOnCursor()} title="Center on crosshair">Center</button>
+					{/* Layout ▾ — view mode (MPR/Axial/Sag/Cor/3D) and, while in MPR, the
+					    pane-layout preset (which pane is enlarged) — both are "ways to view /
+					    arrange the scan," so they share one dropdown instead of two permanently
+					    visible rows of segmented buttons. Stays open on selection (a config
+					    panel, not a pick-and-dismiss menu) so both pickers can be used in one visit. */}
+					<div className="vp-toolgroup" ref={layoutFlyout.groupRef}>
 						<button
-							className="vp-tb-mini"
-							onClick={() => {
-								// Also undoes any oblique-plane rotation from the crosshair's
-								// rotate handles, back to standard axial/sagittal/coronal.
-								resetMprOrientation();
-								zoomToFit();
-								setZoomLevel(1);
-							}}
-							title="Reset zoom, pan & MPR orientation"
-						>Reset</button>
+							ref={layoutFlyout.btnRef}
+							className={`vp-tb-mini vp-tb-mini--flyout ${layoutFlyout.open ? "vp-tb-mini--active" : ""}`}
+							onClick={layoutFlyout.toggle}
+							aria-label="Layout"
+							aria-haspopup="menu"
+							aria-expanded={layoutFlyout.open}
+						>
+							<span>{layoutTriggerLabel}</span>
+							<IconChevronDown size={13} />
+						</button>
+						{layoutFlyout.open && layoutFlyout.pos &&
+							createPortal(
+								<div
+									className="vp-flyout vp-flyout--config"
+									role="menu"
+									ref={layoutFlyout.menuRef}
+									style={{ position: "fixed", top: layoutFlyout.pos.top, left: layoutFlyout.pos.left }}
+								>
+									<span className="vp-panel__title">View</span>
+									<div className="vp-seg" role="group" aria-label="View layout">
+										{VIEW_MODE_OPTIONS.map(({ mode, label }) => (
+											<button
+												key={mode}
+												onClick={() => setViewMode(mode)}
+												className={`vp-seg__btn ${viewMode === mode ? "vp-seg__btn--active" : ""}`}
+											>{label}</button>
+										))}
+									</div>
+									{viewMode === "mpr" && (
+										<>
+											<span className="vp-panel__title">Panes</span>
+											<div className="vp-seg" role="group" aria-label="Pane layout">
+												{LAYOUT_PRESETS.map(({ id, label }) => (
+													<button
+														key={id}
+														onClick={() => setLayoutPreset(id)}
+														className={`vp-seg__btn ${layoutPreset === id ? "vp-seg__btn--active" : ""}`}
+													>{label}</button>
+												))}
+											</div>
+										</>
+									)}
+								</div>,
+								document.body
+							)}
+					</div>
+
+					<span className="vp-tb-divider" />
+
+					{/* Window ▾ — CT presets. Trigger shows the active preset's name; stays
+					    open (a config panel) so presets can be flipped through quickly. */}
+					<div className="vp-toolgroup" ref={windowFlyout.groupRef}>
+						<button
+							ref={windowFlyout.btnRef}
+							className={`vp-tb-mini vp-tb-mini--flyout ${windowFlyout.open ? "vp-tb-mini--active" : ""}`}
+							onClick={windowFlyout.toggle}
+							aria-label="CT window preset"
+							aria-haspopup="menu"
+							aria-expanded={windowFlyout.open}
+						>
+							<span>{activePreset || "Window"}</span>
+							<IconChevronDown size={13} />
+						</button>
+						{windowFlyout.open && windowFlyout.pos &&
+							createPortal(
+								<div
+									className="vp-flyout vp-flyout--config"
+									role="menu"
+									ref={windowFlyout.menuRef}
+									style={{ position: "fixed", top: windowFlyout.pos.top, left: windowFlyout.pos.left }}
+								>
+									{CT_PRESETS.map((preset) => (
+										<button
+											key={preset.name}
+											className={`vp-flyout__item ${activePreset === preset.name ? "is-active" : ""}`}
+											role="menuitem"
+											onClick={() => handlePresetClick(preset)}
+										>
+											<span>{preset.name}</span>
+										</button>
+									))}
+								</div>,
+								document.body
+							)}
+					</div>
+
+					<span className="vp-tb-divider" />
+
+					{/* Adjust ▾ — mask fill/border opacity, brightness, contrast, zoom, plus
+					    center/reset. A live panel (stays open) so the sliders can be dragged
+					    without the menu closing after each change. */}
+					<div className="vp-toolgroup" ref={adjustFlyout.groupRef}>
+						<button
+							ref={adjustFlyout.btnRef}
+							className={`vp-tool ${adjustFlyout.open ? "vp-tool--active" : ""}`}
+							onClick={adjustFlyout.toggle}
+							aria-label="Adjust"
+							aria-haspopup="menu"
+							aria-expanded={adjustFlyout.open}
+						>
+							<IconAdjustmentsHorizontal size={20} color={adjustFlyout.open ? "#08090b" : "white"} />
+							<span className="vp-tool__caret" />
+							<span className="vp-tool__tip">Adjust</span>
+						</button>
+						{adjustFlyout.open && adjustFlyout.pos &&
+							createPortal(
+								<div
+									className="vp-flyout vp-flyout--adjust"
+									role="menu"
+									ref={adjustFlyout.menuRef}
+									style={{ position: "fixed", top: adjustFlyout.pos.top, left: adjustFlyout.pos.left }}
+								>
+									{!isDicom && (
+										<>
+											<label className="vp-tb-slider" title="Mask fill opacity">
+												<span className="vp-tb-slider__label">Fill</span>
+												<input
+													type="range" min="0" max="100" step="1" className="vp-range"
+													aria-label="Mask fill opacity"
+													value={opacityValue}
+													onChange={handleOpacityOnSliderChange}
+												/>
+												<span className="vp-tb-slider__val">{Math.round(opacityValue)}%</span>
+											</label>
+											<label className="vp-tb-slider" title="Mask border opacity">
+												<span className="vp-tb-slider__label">Border</span>
+												<input
+													type="range" min="0" max="100" step="1" className="vp-range"
+													aria-label="Mask border opacity"
+													value={outlineOpacityValue}
+													onChange={handleOutlineOpacityChange}
+												/>
+												<span className="vp-tb-slider__val">{Math.round(outlineOpacityValue)}%</span>
+											</label>
+										</>
+									)}
+									<label className="vp-tb-slider" title="Brightness (window level)">
+										<span className="vp-tb-slider__label">Brt</span>
+										<input
+											type="range" min="-1000" max="1000" step="1" className="vp-range"
+											aria-label="Brightness"
+											value={windowCenter * -1}
+											onChange={(e) => {
+												handleWindowChange(null, Number(e.target.value) * -1);
+												showWindowReadoutBriefly();
+											}}
+										/>
+									</label>
+									<label className="vp-tb-slider" title="Contrast (window width)">
+										<span className="vp-tb-slider__label">Con</span>
+										<input
+											type="range" min="1" max="2000" step="1" className="vp-range"
+											aria-label="Contrast"
+											value={windowWidth}
+											onChange={(e) => {
+												handleWindowChange(Number(e.target.value), null);
+												showWindowReadoutBriefly();
+											}}
+										/>
+									</label>
+									<label className="vp-tb-slider" title="Zoom">
+										<span className="vp-tb-slider__label">Zoom</span>
+										<input
+											type="range" min="0.5" max="2" step="0.05" className="vp-range"
+											aria-label="Zoom"
+											value={zoomLevel}
+											onChange={(e) => setZoomLevel(Number(e.target.value))}
+										/>
+										<span className="vp-tb-slider__val">{zoomLevel.toFixed(1)}×</span>
+									</label>
+									<div className="vp-flyout--adjust__actions">
+										<button className="vp-tb-mini" onClick={() => centerOnCursor()} title="Center on crosshair">Center</button>
+										<button
+											className="vp-tb-mini"
+											onClick={() => {
+												// Also undoes any oblique-plane rotation from the crosshair's
+												// rotate handles, back to standard axial/sagittal/coronal.
+												resetMprOrientation();
+												zoomToFit();
+												setZoomLevel(1);
+											}}
+											title="Reset zoom, pan & MPR orientation"
+										>Reset</button>
+									</div>
+								</div>,
+								document.body
+							)}
 					</div>
 
 					<span className="vp-tb-divider" />
 
 					{/* Tools */}
 									<div className="vp-toolrow vp-tb-tools">
+										{/* Crosshair stays inline — it's the default/most-used navigation mode, not
+										    worth burying behind a menu. Everything else below is grouped into
+										    dropdowns (same portal-flyout pattern as Measure/Cine originally used)
+										    so the bar reads as ~9 clusters instead of ~20 individual icons. */}
 										<button
 												className={`vp-tool ${crosshairToolActive && !activeMeasureTool && !editMode ? "vp-tool--active" : ""}`}
 												onClick={() => {
@@ -1405,26 +1886,29 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 												<IconPointer size={20} color={crosshairToolActive && !activeMeasureTool && !editMode ? "#08090b" : "white"} />
 												<span className="vp-tool__tip">Crosshair</span>
 											</button>
-											<div className="vp-toolgroup" ref={measureGroupRef}>
+
+											{/* Measure ▾ — measurement tools + the magnify loupe (shares the same
+											    primary-mouse-tool slot) + clear. */}
+											<div className="vp-toolgroup" ref={measureFlyout.groupRef}>
 												<button
-													ref={measureBtnRef}
-													className={`vp-tool ${measureToolActive || measureMenuOpen ? "vp-tool--active" : ""}`}
-													onClick={toggleMeasureMenu}
+													ref={measureFlyout.btnRef}
+													className={`vp-tool ${measureToolActive || measureFlyout.open ? "vp-tool--active" : ""}`}
+													onClick={measureFlyout.toggle}
 													aria-label="Measurement tools"
 													aria-haspopup="menu"
-													aria-expanded={measureMenuOpen}
+													aria-expanded={measureFlyout.open}
 												>
-													<ActiveMeasureIcon size={20} color={measureToolActive || measureMenuOpen ? "#08090b" : "white"} />
+													<ActiveMeasureIcon size={20} color={measureToolActive || measureFlyout.open ? "#08090b" : "white"} />
 													<span className="vp-tool__caret" />
 													<span className="vp-tool__tip">Measure</span>
 												</button>
-												{measureMenuOpen && measureMenuPos &&
+												{measureFlyout.open && measureFlyout.pos &&
 													createPortal(
 														<div
 															className="vp-flyout"
 															role="menu"
-															ref={measureMenuRef}
-															style={{ position: "fixed", top: measureMenuPos.top, left: measureMenuPos.left }}
+															ref={measureFlyout.menuRef}
+															style={{ position: "fixed", top: measureFlyout.pos.top, left: measureFlyout.pos.left }}
 														>
 															{MEASURE_TOOLS.map(({ name, label, Icon, key: hotkey }) => (
 																<button
@@ -1434,7 +1918,7 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 																	onClick={() => {
 																		setEditMode(null);
 																		setActiveMeasureTool((p) => (p === name ? null : name));
-																		setMeasureMenuOpen(false);
+																		measureFlyout.close();
 																	}}
 																>
 																	<Icon size={18} />
@@ -1447,7 +1931,7 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 																role="menuitem"
 																onClick={() => {
 																	clearMeasurements();
-																	setMeasureMenuOpen(false);
+																	measureFlyout.close();
 																}}
 															>
 																<IconTrash size={18} />
@@ -1457,31 +1941,141 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 														document.body
 													)}
 											</div>
-											<button
-												className={`vp-tool ${activeMeasureTool === MAGNIFY_TOOL ? "vp-tool--active" : ""}`}
-												onClick={() => {
-													setEditMode(null);
-													setActiveMeasureTool((p) => (p === MAGNIFY_TOOL ? null : MAGNIFY_TOOL));
-												}}
-												aria-label="Magnify"
-											>
-												<IconZoomIn size={20} color={activeMeasureTool === MAGNIFY_TOOL ? "#08090b" : "white"} />
-												<span className="vp-tool__tip">Magnify (G) — click a pane to place a loupe</span>
-											</button>
-											<button
-												className={`vp-tool ${cinePlaying ? "vp-tool--active" : ""}`}
-												onClick={toggleCine}
-												aria-label={cinePlaying ? "Stop cine playback" : "Start cine playback"}
-											>
-												{cinePlaying ? (
-													<IconPlayerPause size={20} color="#08090b" />
-												) : (
-													<IconPlayerPlay size={20} color="white" />
-												)}
-												<span className="vp-tool__tip">
-													{cinePlaying ? "Stop cine (V)" : `Cine: play through ${cinePane} slices (V)`}
-												</span>
-											</button>
+
+											{/* View ▾ — hover-identify + reference lines (toggles) and flip/rotate
+											    (one-shot actions on the focused pane). */}
+											<div className="vp-toolgroup" ref={viewFlyout.groupRef}>
+												<button
+													ref={viewFlyout.btnRef}
+													className={`vp-tool ${viewGroupActive || viewFlyout.open ? "vp-tool--active" : ""}`}
+													onClick={viewFlyout.toggle}
+													aria-label="View options"
+													aria-haspopup="menu"
+													aria-expanded={viewFlyout.open}
+												>
+													<IconEye size={20} color={viewGroupActive || viewFlyout.open ? "#08090b" : "white"} />
+													<span className="vp-tool__caret" />
+													<span className="vp-tool__tip">View</span>
+												</button>
+												{viewFlyout.open && viewFlyout.pos &&
+													createPortal(
+														<div
+															className="vp-flyout"
+															role="menu"
+															ref={viewFlyout.menuRef}
+															style={{ position: "fixed", top: viewFlyout.pos.top, left: viewFlyout.pos.left }}
+														>
+															<button
+																className={`vp-flyout__item ${hoverIdentifyEnabled ? "is-active" : ""}`}
+																role="menuitem"
+																title="Name the organ under the cursor"
+																onClick={() => {
+																	setHoverIdentifyEnabled((v) => !v);
+																	setHoverOrganTip((t) => (t.visible ? { ...t, visible: false } : t));
+																	viewFlyout.close();
+																}}
+															>
+																<IconScanEye size={18} />
+																<span>{hoverIdentifyEnabled ? "Hover identify: on" : "Hover identify"}</span>
+															</button>
+															<button
+																className={`vp-flyout__item ${referenceLinesOn ? "is-active" : ""}`}
+																role="menuitem"
+																title="Dotted line in the other panes for whichever pane you scroll"
+																onClick={() => {
+																	setReferenceLinesOn((v) => !v);
+																	viewFlyout.close();
+																}}
+															>
+																<IconGrid3x3 size={18} />
+																<span>{referenceLinesOn ? "Reference lines: on" : "Reference lines"}</span>
+															</button>
+															<button
+																className="vp-flyout__item"
+																role="menuitem"
+																title="The focused pane — last one scrolled or clicked"
+																onClick={() => {
+																	handleFlipHorizontal();
+																	viewFlyout.close();
+																}}
+															>
+																<IconFlipHorizontal size={18} />
+																<span>Flip horizontal</span>
+															</button>
+															<button
+																className="vp-flyout__item"
+																role="menuitem"
+																title="The focused pane — last one scrolled or clicked"
+																onClick={() => {
+																	handleRotate90Clockwise();
+																	viewFlyout.close();
+																}}
+															>
+																<IconRotateClockwise size={18} />
+																<span>Rotate 90° clockwise</span>
+															</button>
+														</div>,
+														document.body
+													)}
+											</div>
+
+											{/* Cine ▾ — the one flyout that stays open on click: a live mini-panel
+											    (play/pause + FPS side by side), not a pick-and-dismiss menu. */}
+											<div className="vp-toolgroup" ref={cineFlyout.groupRef}>
+												<button
+													ref={cineFlyout.btnRef}
+													className={`vp-tool ${cinePlaying || cineFlyout.open ? "vp-tool--active" : ""}`}
+													onClick={cineFlyout.toggle}
+													aria-label="Cine controls"
+													aria-haspopup="menu"
+													aria-expanded={cineFlyout.open}
+												>
+													{cinePlaying ? (
+														<IconPlayerPause size={20} color={cineFlyout.open ? "#08090b" : "white"} />
+													) : (
+														<IconPlayerPlay size={20} color={cineFlyout.open ? "#08090b" : "white"} />
+													)}
+													<span className="vp-tool__tip">
+														{cinePlaying ? `Cine playing (${cineFps} fps) — click for controls` : "Cine controls (V to play)"}
+													</span>
+												</button>
+												{cineFlyout.open && cineFlyout.pos &&
+													createPortal(
+														<div
+															className="vp-flyout vp-flyout--cine"
+															role="menu"
+															ref={cineFlyout.menuRef}
+															style={{ position: "fixed", top: cineFlyout.pos.top, left: cineFlyout.pos.left }}
+														>
+															<button
+																className={`vp-tool vp-tool--cine-play ${cinePlaying ? "vp-tool--active" : ""}`}
+																onClick={toggleCine}
+																aria-label={cinePlaying ? "Pause cine playback" : "Play cine playback"}
+															>
+																{cinePlaying ? (
+																	<IconPlayerPause size={20} color="#08090b" />
+																) : (
+																	<IconPlayerPlay size={20} color="white" />
+																)}
+															</button>
+															<label className="vp-tb-slider vp-tb-slider--cine" title="Cine playback speed">
+																<span className="vp-tb-slider__label">FPS</span>
+																<input
+																	type="range" min="1" max="100" step="1" className="vp-range"
+																	aria-label="Cine frames per second"
+																	value={cineFps}
+																	onChange={(e) => handleCineFpsChange(Number(e.target.value))}
+																/>
+																<span className="vp-tb-slider__val">{cineFps}</span>
+															</label>
+														</div>,
+														document.body
+													)}
+											</div>
+
+											{/* Undo/redo stay standalone (not grouped) — they're used constantly
+											    during a review and shouldn't cost an extra click to reach. Cover
+											    measurements as well as mask edits; ⌘Z/⇧⌘Z work everywhere too. */}
 											<button
 												className="vp-tool"
 												onClick={() => undoMaskEdit()}
@@ -1503,6 +2097,7 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 													className={`vp-tool ${showEditPanel || editMode ? "vp-tool--active" : ""}`}
 													onClick={() => {
 														setShowStats(false);
+														setShowMetadata(false);
 														setShowMeasurePanel(false);
 														setShowEditPanel((v) => {
 															const next = !v;
@@ -1516,116 +2111,195 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 													<span className="vp-tool__tip">Edit masks</span>
 												</button>
 											)}
-											<button
-												className={`vp-tool ${showMeasurePanel ? "vp-tool--active" : ""}`}
-												onClick={() => {
-													setShowStats(false);
-													setShowEditPanel(false);
-													setEditMode(null);
-													setShowMeasurePanel((v) => !v);
-												}}
-												aria-label="Measurements list"
-											>
-												<IconListDetails size={20} color={showMeasurePanel ? "#08090b" : "white"} />
-												<span className="vp-tool__tip">Measurements (M)</span>
-											</button>
-											<button
-												className="vp-tool"
-												onClick={() => { void takeSnapshot(); }}
-												aria-label="Capture snapshot"
-											>
-												<IconCamera size={20} color="white" />
-												<span className="vp-tool__tip">Snapshot (S)</span>
-											</button>
-											<button
-												className={`vp-tool ${readingSession ? "vp-tool--rec" : ""}`}
-												onClick={() => {
-													if (readingSession) void stopReadingSession();
-													else void startReadingSession();
-												}}
-												disabled={sessionStarting}
-												aria-label={readingSession ? "Stop reading session" : "Start reading session"}
-											>
-												<IconMicrophone size={20} color={readingSession ? "#fecdd3" : "white"} />
-												<span className="vp-tool__tip">
-													{readingSession
-														? "Stop reading session"
-														: sessionStarting
-															? "Starting…"
-															: "Record reading session"}
-												</span>
-											</button>
+
+											{/* Capture ▾ — snapshot, voice-narrated reading session, share link. */}
+											<div className="vp-toolgroup" ref={captureFlyout.groupRef}>
+												<button
+													ref={captureFlyout.btnRef}
+													className={`vp-tool ${readingSession ? "vp-tool--rec" : ""} ${captureFlyout.open ? "vp-tool--active" : ""}`}
+													onClick={captureFlyout.toggle}
+													aria-label="Capture and session tools"
+													aria-haspopup="menu"
+													aria-expanded={captureFlyout.open}
+												>
+													<IconCamera size={20} color={captureFlyout.open ? "#08090b" : "white"} />
+													<span className="vp-tool__caret" />
+													<span className="vp-tool__tip">
+														{readingSession ? "Recording — capture / share" : "Capture"}
+													</span>
+												</button>
+												{captureFlyout.open && captureFlyout.pos &&
+													createPortal(
+														<div
+															className="vp-flyout"
+															role="menu"
+															ref={captureFlyout.menuRef}
+															style={{ position: "fixed", top: captureFlyout.pos.top, left: captureFlyout.pos.left }}
+														>
+															<button
+																className="vp-flyout__item"
+																role="menuitem"
+																onClick={() => {
+																	void takeSnapshot();
+																	captureFlyout.close();
+																}}
+															>
+																<IconCamera size={18} />
+																<span>Snapshot</span>
+																<span className="vp-flyout__kbd">S</span>
+															</button>
+															<button
+																className={`vp-flyout__item ${readingSession ? "is-active" : ""}`}
+																role="menuitem"
+																disabled={sessionStarting}
+																onClick={() => {
+																	if (readingSession) void stopReadingSession();
+																	else void startReadingSession();
+																	captureFlyout.close();
+																}}
+															>
+																<IconMicrophone size={18} />
+																<span>
+																	{readingSession
+																		? "Stop reading session"
+																		: sessionStarting
+																			? "Starting…"
+																			: "Record reading session"}
+																</span>
+															</button>
+															{!isDicom && (
+																<button
+																	className="vp-flyout__item"
+																	role="menuitem"
+																	onClick={() => {
+																		void handleShare();
+																		captureFlyout.close();
+																	}}
+																>
+																	{shareCopied ? <IconCheck size={18} /> : <IconShare size={18} />}
+																	<span>{shareCopied ? "Link copied!" : "Share this view"}</span>
+																</button>
+															)}
+														</div>,
+														document.body
+													)}
+											</div>
+
+											{/* Panels ▾ — every side-panel opener in one place (organs list, organ
+											    stats, case metadata, measurements). */}
+											<div className="vp-toolgroup" ref={panelsFlyout.groupRef}>
+												<button
+													ref={panelsFlyout.btnRef}
+													className={`vp-tool ${panelsGroupActive || panelsFlyout.open ? "vp-tool--active" : ""}`}
+													onClick={panelsFlyout.toggle}
+													aria-label="Panels"
+													aria-haspopup="menu"
+													aria-expanded={panelsFlyout.open}
+												>
+													<IconLayoutSidebarRight size={20} color={panelsGroupActive || panelsFlyout.open ? "#08090b" : "white"} />
+													<span className="vp-tool__caret" />
+													<span className="vp-tool__tip">Panels</span>
+												</button>
+												{panelsFlyout.open && panelsFlyout.pos &&
+													createPortal(
+														<div
+															className="vp-flyout"
+															role="menu"
+															ref={panelsFlyout.menuRef}
+															style={{ position: "fixed", top: panelsFlyout.pos.top, left: panelsFlyout.pos.left }}
+														>
+															{!isDicom && (
+																<button
+																	className={`vp-flyout__item ${showOrganDetails ? "is-active" : ""}`}
+																	role="menuitem"
+																	onClick={() => {
+																		if (showOrganDetails) {
+																			setShowOrganDetails(false);
+																		} else {
+																			setShowStats(false);
+																			setShowMetadata(false);
+																			setShowMeasurePanel(false);
+																			setShowOrganDetails(true);
+																		}
+																		panelsFlyout.close();
+																	}}
+																>
+																	<IconStack2 size={18} />
+																	<span>Organs</span>
+																</button>
+															)}
+															{!isDicom && (
+																<button
+																	className={`vp-flyout__item ${showStats ? "is-active" : ""}`}
+																	role="menuitem"
+																	onClick={() => {
+																		handleToggleStats();
+																		panelsFlyout.close();
+																	}}
+																>
+																	<IconChartBar size={18} />
+																	<span>Organ stats</span>
+																</button>
+															)}
+															{!isDicom && (
+																<button
+																	className={`vp-flyout__item ${showMetadata ? "is-active" : ""}`}
+																	role="menuitem"
+																	onClick={() => {
+																		handleToggleMetadata();
+																		panelsFlyout.close();
+																	}}
+																>
+																	<IconId size={18} />
+																	<span>Case metadata</span>
+																</button>
+															)}
+															<button
+																className={`vp-flyout__item ${showMeasurePanel ? "is-active" : ""}`}
+																role="menuitem"
+																onClick={() => {
+																	setShowStats(false);
+																	setShowMetadata(false);
+																	setShowEditPanel(false);
+																	setEditMode(null);
+																	setShowMeasurePanel((v) => !v);
+																	panelsFlyout.close();
+																}}
+															>
+																<IconListDetails size={18} />
+																<span>Measurements</span>
+																<span className="vp-flyout__kbd">M</span>
+															</button>
+														</div>,
+														document.body
+													)}
+											</div>
+
+											{/* Report and Download stay standalone and separate (not grouped with
+											    each other) — distinct export actions users reach for independently. */}
 											{!isDicom && (
 												<button
-													className={`vp-tool ${shareCopied ? "vp-tool--active" : ""}`}
-													onClick={handleShare}
-													aria-label="Copy a shareable link to this view"
+													className="vp-tool"
+													onClick={handleDownloadClick}
+													aria-label="Download segmentations"
 												>
-													{shareCopied ? (
-														<IconCheck size={20} color="#08090b" />
-													) : (
-														<IconShare size={20} color="white" />
-													)}
-													<span className="vp-tool__tip">{shareCopied ? "Link copied!" : "Share this view"}</span>
+													<IconDownload size={20} color="white" />
+													<span className="vp-tool__tip">Download</span>
 												</button>
 											)}
-											{/* <div className="group cursor-pointer rounded-md relative">
-													{!zoomMode ? (
-														<>
-															<div className="border-gray-500 hover:bg-gray-700 border rounded-md p-2">
-
-															<IconZoom
-																onClick={() => setZoomMode(true)}
-																className="w-6 h-6 text-white relative"
-																></IconZoom>
-															</div>
-															<span className="transition-all pointer-events-none duration-100 scale-0 group-hover:scale-100 absolute top-0 left-12 z-1 bg-gray-900 text-white rounded-md p-2">
-																Zoom
-															</span>
-														</>
-													) : null }
-												</div> */}
-
 											{!isDicom && (
-												<>
-													<button
-														className="vp-tool"
-														onClick={handleDownloadClick}
-														aria-label="Download segmentations"
-													>
-														<IconDownload size={20} color="white" />
-														<span className="vp-tool__tip">Download</span>
-													</button>
-													<button
-														className="vp-tool"
-														onClick={() => {
-															setShowReportScreen(true);
-															setViewMode("3d");
-															setShowToolbar(false);
-														}}
-														aria-label="Open report"
-													>
-														<IconReport size={20} color="white" />
-														<span className="vp-tool__tip">Report</span>
-													</button>
-													<button
-														className={`vp-tool ${showStats ? "vp-tool--active" : ""}`}
-														onClick={handleToggleStats}
-														aria-label="Organ statistics"
-													>
-														<IconChartBar size={20} color={showStats ? "#08090b" : "white"} />
-														<span className="vp-tool__tip">Organ stats</span>
-													</button>
-													<button
-														className={`vp-tool ${showAISidebar ? "vp-tool--active" : ""}`}
-														onClick={() => setShowAISidebar((visible) => !visible)}
-														aria-label="Open BodyMaps AI"
-													>
-														<span style={{ fontFamily: "var(--vp-mono)", fontSize: "12px", fontWeight: 700 }}>AI</span>
-														<span className="vp-tool__tip">BodyMaps AI</span>
-													</button>
-												</>
+												<button
+													className="vp-tool"
+													onClick={() => setShowReportScreen(true)}
+													aria-label="Open report"
+												>
+													<IconReport size={20} color="white" />
+													<span className="vp-tool__tip">Report</span>
+												</button>
 											)}
+
+											{/* HD and AI stay inline: HD is a live status indicator (streaming %),
+											    and AI is a headline feature — neither belongs buried in a menu. */}
 											{!sessionId && localAvailable && (
 												<button
 													className={`vp-tool ${isHd || enhance.state === "done" ? "vp-tool--active" : ""} ${enhance.state === "streaming" ? "vp-tool--busy" : ""}`}
@@ -1654,23 +2328,14 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 													</span>
 												</button>
 											)}
-											{/* Organs panel opener (was the "Class Map" button) */}
 											{!isDicom && (
 												<button
-													className={`vp-tool ${showOrganDetails ? "vp-tool--active" : ""}`}
-													onClick={() => {
-														if (showOrganDetails) {
-															setShowOrganDetails(false);
-														} else {
-															setShowStats(false);
-															setShowMeasurePanel(false);
-															setShowOrganDetails(true);
-														}
-													}}
-													aria-label="Organs"
+													className={`vp-tool ${showAISidebar ? "vp-tool--active" : ""}`}
+													onClick={() => setShowAISidebar((visible) => !visible)}
+													aria-label="Open BodyMaps AI"
 												>
-													<IconStack2 size={20} color={showOrganDetails ? "#08090b" : "white"} />
-													<span className="vp-tool__tip">Organs</span>
+													<span style={{ fontFamily: "var(--vp-mono)", fontSize: "12px", fontWeight: 700 }}>AI</span>
+													<span className="vp-tool__tip">BodyMaps AI</span>
 												</button>
 											)}
 										</div>
@@ -1710,104 +2375,88 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 			{/* Stage — fills the space below the toolbar; the viewports live here. */}
 			<div className="vp-stage" ref={stageRef}>
 
-				{/* {
-          loading ?
-          <div className="flex z-3 absolute top-0 left-0 w-screen h-screen items-center justify-center">
-              <div role="status">
-                  <svg aria-hidden="true" className="w-8 h-8 text-gray-200 animate-spin dark:text-gray-600 fill-white" viewBox="0 0 100 101" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M100 50.5908C100 78.2051 77.6142 100.591 50 100.591C22.3858 100.591 0 78.2051 0 50.5908C0 22.9766 22.3858 0.59082 50 0.59082C77.6142 0.59082 100 22.9766 100 50.5908ZM9.08144 50.5908C9.08144 73.1895 27.4013 91.5094 50 91.5094C72.5987 91.5094 90.9186 73.1895 90.9186 50.5908C90.9186 27.9921 72.5987 9.67226 50 9.67226C27.4013 9.67226 9.08144 27.9921 9.08144 50.5908Z" fill="currentColor"/><path d="M93.9676 39.0409C96.393 38.4038 97.8624 35.9116 97.0079 33.5539C95.2932 28.8227 92.871 24.3692 89.8167 20.348C85.8452 15.1192 80.8826 10.7238 75.2124 7.41289C69.5422 4.10194 63.2754 1.94025 56.7698 1.05124C51.7666 0.367541 46.6976 0.446843 41.7345 1.27873C39.2613 1.69328 37.813 4.19778 38.4501 6.62326C39.0873 9.04874 41.5694 10.4717 44.0505 10.1071C47.8511 9.54855 51.7191 9.52689 55.5402 10.0491C60.8642 10.7766 65.9928 12.5457 70.6331 15.2552C75.2735 17.9648 79.3347 21.5619 82.5849 25.841C84.9175 28.9121 86.7997 32.2913 88.1811 35.8758C89.083 38.2158 91.5421 39.6781 93.9676 39.0409Z" fill="currentFill"/></svg>
-                  <span className="sr-only">Loading...</span>
-              </div>
-          </div>
-          :
-          null
-        } */}
 				{loading ? (
-					<>
-						{pantsCase && (
-							<div className="vp-loadinfo">
-								<div className="w-fit">
-									<SnakeGame />
+					<div className="vp-loading">
+						<div className="vp-spinner" />
+						<div className="vp-loading__text">Preparing case {caseId}…</div>
+						{pantsCase && (dlDone || dlPct != null) && (
+							<div className="vp-progress">
+								<div className="vp-progress__head">
+									<span className="vp-progress__label">
+										{dlDone ? "Finalizing…" : "Loading scan"}
+									</span>
+									{!dlDone && dlPct != null && (
+										<span className="vp-progress__pct">{dlPct}%</span>
+									)}
 								</div>
-								{(dlDone || dlPct != null) && (
-									<div className="vp-progress">
-										<div className="vp-progress__head">
-											<span className="vp-progress__label">
-												{dlDone ? "Finalizing…" : "Loading scan"}
-											</span>
-											{!dlDone && dlPct != null && (
-												<span className="vp-progress__pct">{dlPct}%</span>
-											)}
-										</div>
-										<div className="vp-progress__track">
-											<div
-												className={`vp-progress__fill ${dlDone ? "is-finalizing" : ""}`}
-												style={dlDone ? undefined : { width: `${dlPct ?? 0}%` }}
-											/>
-										</div>
-									</div>
-								)}
+								<div className="vp-progress__track">
+									<div
+										className={`vp-progress__fill ${dlDone ? "is-finalizing" : ""}`}
+										style={dlDone ? undefined : { width: `${dlPct ?? 0}%` }}
+									/>
+								</div>
 							</div>
 						)}
-						{/* 3D organ loader; falls back to a lightweight spinner if it can't
-						    render (lazy chunk error / WebGL context unavailable). */}
-						<ErrorBoundary
-							fallback={
-								<div className="vp-loading">
-									<div className="flex flex-col items-center gap-4">
-										<div className="vp-spinner" />
-										<div className="vp-loading__text">Preparing case {caseId}…</div>
-									</div>
-								</div>
-							}
-						>
-							<Suspense
-								fallback={
-									<div className="vp-loading">
-										<div className="vp-spinner" />
-									</div>
-								}
-							>
-								<RotatingModelLoader />
-							</Suspense>
-						</ErrorBoundary>
-					</>
+					</div>
 				) : null}
 				<div
 					className="visualization-container"
 					ref={VisualizationContainer_ref}
 					style={{
 						overflow: "hidden",
-						// Collapse to a single cell only for the 2D single views. MPR and 3D keep
-						// the 2×2 grid (3D just overlays the render pane on top of it).
+						// Collapse to a single cell only for the 2D single views. MPR keeps a grid
+						// (2×2 by default, or a wide primary column + narrow stacked column for an
+						// asymmetric layout preset); 3D also keeps the 2×2 grid underneath since it
+						// just overlays the render pane on top of it.
 						...(viewMode !== "mpr" && viewMode !== "3d"
 							? { gridTemplateColumns: "1fr", gridTemplateRows: "1fr" }
-							: {}),
+							: viewMode === "mpr" && layoutPreset !== "grid"
+								? { gridTemplateColumns: "2fr 1fr", gridTemplateRows: "1fr 1fr 1fr" }
+								: {}),
 					}}
 				>
-					<div
-						className={`axial ${loading ? "" : "vp-pane vp-pane--axial"}`}
-						data-label="Axial"
-						ref={axial_ref}
-						style={panelStyle("axial")}
-						onClick={(e) => { handleMouseClick(e); }}
-					></div>
-					<div
-						className={`sagittal ${loading ? "" : "vp-pane vp-pane--sagittal"}`}
-						data-label="Sagittal"
-						ref={sagittal_ref}
-						style={panelStyle("sagittal")}
-						onClick={(e) => { handleMouseClick(e); }}
-					></div>
+					<div className="vp-pane-wrap" style={{ ...panelStyle("axial"), ...paneGridStyle("axial") }}>
+						<div
+							className={`axial ${loading ? "" : "vp-pane vp-pane--axial"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}`}
+							data-label="Axial"
+							ref={axial_ref}
+							onClick={(e) => { handleMouseClick(e); }}
+							onMouseDown={handlePaneMouseDown("axial")}
+							onMouseMove={handlePaneHover("axial")}
+							onMouseLeave={handlePaneHoverLeave}
+							onWheel={handlePaneWheel("axial")}
+						></div>
+						{!loading && renderPaneOverlays("axial")}
+					</div>
+					<div className="vp-pane-wrap" style={{ ...panelStyle("sagittal"), ...paneGridStyle("sagittal") }}>
+						<div
+							className={`sagittal ${loading ? "" : "vp-pane vp-pane--sagittal"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}`}
+							data-label="Sagittal"
+							ref={sagittal_ref}
+							onClick={(e) => { handleMouseClick(e); }}
+							onMouseDown={handlePaneMouseDown("sagittal")}
+							onMouseMove={handlePaneHover("sagittal")}
+							onMouseLeave={handlePaneHoverLeave}
+							onWheel={handlePaneWheel("sagittal")}
+						></div>
+						{!loading && renderPaneOverlays("sagittal")}
+					</div>
 
-					<div
-						className={`coronal ${loading ? "" : "vp-pane vp-pane--coronal"}`}
-						data-label="Coronal"
-						ref={coronal_ref}
-						style={panelStyle("coronal")}
-						onClick={(e) => { handleMouseClick(e); }}
-					></div>
+					<div className="vp-pane-wrap" style={{ ...panelStyle("coronal"), ...paneGridStyle("coronal") }}>
+						<div
+							className={`coronal ${loading ? "" : "vp-pane vp-pane--coronal"}${hoverIdentifyEnabled ? " vp-pane--hover-identify" : ""}`}
+							data-label="Coronal"
+							ref={coronal_ref}
+							onClick={(e) => { handleMouseClick(e); }}
+							onMouseDown={handlePaneMouseDown("coronal")}
+							onMouseMove={handlePaneHover("coronal")}
+							onMouseLeave={handlePaneHoverLeave}
+							onWheel={handlePaneWheel("coronal")}
+						></div>
+						{!loading && renderPaneOverlays("coronal")}
+					</div>
 
-					<div className={`render ${loading ? "" : "vp-pane vp-pane--render"}`} data-label="3D" style={panelStyle("3d")}>
+					<div className={`render ${loading ? "" : "vp-pane vp-pane--render"}`} data-label="3D" style={{ ...panelStyle("3d"), ...paneGridStyle("3d") }}>
 						<div className="canvas">
 							{threeDMode === "volume" ? (
 								volume3DFailed ? (
@@ -1867,6 +2516,16 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 					</div>
 				</div>
 			</div>
+
+			{hoverOrganTip.visible && (
+				<div
+					className="vp-organ-tip"
+					style={{ left: hoverOrganTip.x, top: hoverOrganTip.y, borderLeftColor: hoverOrganTip.color }}
+				>
+					<span className="vp-organ-tip__swatch" style={{ background: hoverOrganTip.color }} />
+					{hoverOrganTip.text}
+				</div>
+			)}
 
 			{showStats && (
 				<div className="vp-stats">
@@ -1930,37 +2589,135 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 								</div>
 								{statRows.map((r, i) => {
 									const flagged = r.percentile !== null && (r.percentile < 5 || r.percentile > 95);
+									const expanded = expandedStatRow === i;
 									return (
-										<div className="vp-stats__row" key={`${r.organ_name}-${i}`}>
-											<span>{r.label}</span>
-											<span>{r.volume_cm3 === null ? "NA" : `${Math.round(r.volume_cm3)} cm³`}</span>
-											<span>{r.mean_hu === null ? "NA" : Math.round(r.mean_hu)}</span>
-											{organNorms && (
-												<span
-													className={`vp-stats__pct${flagged ? " vp-stats__pct--flag" : ""}`}
-													title={
-														r.percentile !== null
-															? `${Math.round(r.percentile)}th percentile vs ${describeBasis(r.basis as string)} (n=${r.n})`
-															: "No reference group for this organ"
+										<React.Fragment key={`${r.organ_name}-${i}`}>
+											<div
+												className={`vp-stats__row vp-stats__row--expandable${i % 2 === 1 ? " vp-stats__row--odd" : ""}`}
+												role="button"
+												tabIndex={0}
+												aria-expanded={expanded}
+												onClick={() => setExpandedStatRow(expanded ? null : i)}
+												onKeyDown={(e) => {
+													if (e.key === "Enter" || e.key === " ") {
+														e.preventDefault();
+														setExpandedStatRow(expanded ? null : i);
 													}
-												>
-													{r.percentile !== null ? (
-														<>
-															<span className="vp-stats__pctnum">p{Math.round(r.percentile)}</span>
-															<PercentileBar percentile={r.percentile} flagged={flagged} />
-														</>
-													) : (
-														"—"
+												}}
+											>
+												<span>
+													<span className={`vp-stats__chevron${expanded ? " vp-stats__chevron--open" : ""}`}>
+														›
+													</span>
+													{r.label}
+													{r.truncated && (
+														<span className="vp-stats__truncated-flag" title="Mask reaches the volume edge — metrics may be clipped">
+															⚠
+														</span>
 													)}
 												</span>
+												<span>{r.volume_cm3 === null ? "NA" : `${Math.round(r.volume_cm3)} cm³`}</span>
+												<span>{r.mean_hu === null ? "NA" : Math.round(r.mean_hu)}</span>
+												{organNorms && (
+													<span
+														className={`vp-stats__pct${flagged ? " vp-stats__pct--flag" : ""}`}
+														title={
+															r.percentile !== null
+																? `${Math.round(r.percentile)}th percentile vs ${describeBasis(r.basis as string)} (n=${r.n})`
+																: "No reference group for this organ"
+														}
+													>
+														{r.percentile !== null ? (
+															<>
+																<span className="vp-stats__pctnum">p{Math.round(r.percentile)}</span>
+																<PercentileBar percentile={r.percentile} flagged={flagged} />
+															</>
+														) : (
+															"—"
+														)}
+													</span>
+												)}
+											</div>
+											{expanded && (
+												<div className="vp-stats__detail">
+													<div className="vp-stats__detail-item">
+														<span>Median HU</span>
+														<span>{fmtStat(r.median)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Std Dev HU</span>
+														<span>{fmtStat(r.standard_deviation)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Min HU</span>
+														<span>{fmtStat(r.min_value)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Max HU</span>
+														<span>{fmtStat(r.max_value)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Skewness</span>
+														<span>{fmtStat(r.skewness, 2)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Kurtosis</span>
+														<span>{fmtStat(r.kurtosis, 2)}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Voxel Count</span>
+														<span>{r.voxel_count === null ? "—" : r.voxel_count.toLocaleString()}</span>
+													</div>
+													<div className="vp-stats__detail-item">
+														<span>Truncated</span>
+														<span>{r.truncated ? "Yes" : "No"}</span>
+													</div>
+												</div>
 											)}
-										</div>
+										</React.Fragment>
 									);
 								})}
 							</div>
 						</>
 					) : (
 						<div className="vp-stats__msg">No organ data available.</div>
+					)}
+				</div>
+			)}
+
+			{showMetadata && (
+				<div className="vp-stats">
+					<div className="vp-stats__head">
+						<span className="vp-panel__title">Case Metadata</span>
+						<button
+							className="vp-stats__close"
+							onClick={() => setShowMetadata(false)}
+							aria-label="Close case metadata"
+						>
+							×
+						</button>
+					</div>
+					{!pantsCase ? (
+						<div className="vp-stats__msg">
+							Case metadata is only available for dataset cases.
+						</div>
+					) : !caseMetadata ? (
+						<div className="vp-stats__msg">
+							{demographicsTriedRef.current
+								? "No metadata available for this case."
+								: "Loading…"}
+						</div>
+					) : (
+						<div className="vp-meta__list">
+							{METADATA_FIELDS.map(({ key, label }, i) => (
+								<div className={`vp-meta__row${i % 2 === 1 ? " vp-meta__row--odd" : ""}`} key={key}>
+									<span className="vp-meta__label">{label}</span>
+									<span className="vp-meta__value">
+										{formatMetaValue(key, caseMetadata[key])}
+									</span>
+								</div>
+							))}
+						</div>
 					)}
 				</div>
 			)}
