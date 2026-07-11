@@ -5,11 +5,11 @@ import {
   ROI_TOOL,
   moveCornerstoneCrosshairToMm,
   getOrganCentroids,
-  setFillOpacity,
+  setToolGroupOpacity,
   setZoom as csSetZoom,
   zoomToFit as csZoomToFit,
 } from "../../helpers/CornerstoneNifti2";
-import type { MeasurementToolName, PrimaryMouseToolName } from "../../helpers/CornerstoneNifti2";
+import type { MeasurementToolName } from "../../helpers/CornerstoneNifti2";
 import { segmentation_categories } from "../../helpers/constants";
 import type { CheckBoxData } from "../../types";
 import type { ViewerActions } from "./types";
@@ -56,7 +56,7 @@ export function buildViewerActions(opts: {
   setOpacityValue: React.Dispatch<React.SetStateAction<number>>;
   handleWindowChange: (width: number | null, center: number | null) => void;
   setViewModeFn: (view: "mpr" | "axial" | "sagittal" | "coronal" | "3d") => void;
-  setActiveMeasureToolFn: React.Dispatch<React.SetStateAction<PrimaryMouseToolName | null>>;
+  setActiveMeasureToolFn: React.Dispatch<React.SetStateAction<MeasurementToolName | null>>;
   caseId: string;
   apiBase: string;
 }): ViewerActions {
@@ -135,7 +135,7 @@ export function buildViewerActions(opts: {
     setOpacity(value) {
       const clamped = Math.max(0, Math.min(100, value));
       setOpacityValue(clamped);
-      setFillOpacity(clamped / 100);
+      setToolGroupOpacity(clamped / 100);
     },
 
     setWindow(width, center) {
