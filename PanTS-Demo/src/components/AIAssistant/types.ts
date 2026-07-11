@@ -1,3 +1,4 @@
+// Trigger typecheck using the latest AI assistant files.
 export type AIAction =
   | { type: "isolate_organs"; organs: string[] }
   | { type: "show_organs"; organs: string[] }
