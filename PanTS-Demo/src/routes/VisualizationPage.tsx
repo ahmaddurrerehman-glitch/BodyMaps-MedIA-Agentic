@@ -16,13 +16,15 @@ import {
     IconChevronDown,
     IconCircle,
     IconClick,
-    IconDownload, IconHome, IconListDetails, IconMicrophone, IconPlayerPause, IconPlayerPlay, IconPointer, IconReport,
+    IconDownload,
     IconEye,
     IconFlipHorizontal,
     IconGrid3x3,
+    IconHome,
     IconId,
     IconLasso,
     IconLayoutSidebarRight,
+    IconListDetails, IconMicrophone, IconPlayerPause, IconPlayerPlay, IconPointer, IconReport,
     IconRotateClockwise,
     IconRuler2,
     IconScanEye,
@@ -359,6 +361,8 @@ function VisualizationPage() {
 	// const TaskMenu_ref = useRef(null);
 	const VisualizationContainer_ref = useRef(null);
 	//   const lastClickInfoRef = useRef(null);
+	const preIsolateCheckStateRef = useRef<boolean[] | null>(null);
+	//const [isolatedOrgan, setIsolatedOrgan] = useState<string | null>(null);
 
 	const [checkState, setCheckState] = useState<boolean[]>([true]);
 	const [NV, _setNV] = useState<Niivue | undefined>();
@@ -1227,6 +1231,52 @@ function VisualizationPage() {
 			return next;
 		});
 	};
+
+	const handleOrganHighlight = useCallback((organName: string, centroidMm?: [number, number, number]) => {
+		if (centroidMm) {
+			moveCornerstoneCrosshairToMm(centroidMm);
+			setCrosshairMm(centroidMm);
+		}
+		const idx = segmentation_categories.findIndex(
+			(cat) => cat === organName || cat.startsWith(organName)
+		);
+		if (idx === -1) return;
+		const labelId = idx + 1;
+		setCheckState((prev) => {
+			if (!preIsolateCheckStateRef.current) {
+				preIsolateCheckStateRef.current = prev;
+			}
+			const next = prev.map(() => false);
+			next[0] = true;
+			next[labelId] = true;
+			return next;
+		});
+	}, []);
+
+	const handleClearIsolation = useCallback(() => {
+		if (preIsolateCheckStateRef.current) {
+			setCheckState(preIsolateCheckStateRef.current);
+			preIsolateCheckStateRef.current = null;
+		}
+	}, []);
+
+	const handleHideOrgans = useCallback((organNames: string[]) => {
+		setCheckState(prev => {
+			if (!preIsolateCheckStateRef.current) {
+				preIsolateCheckStateRef.current = [...prev];
+			}
+			const next = [...prev];
+			organNames.forEach(name => {
+				const idx = segmentation_categories.findIndex(
+					cat => cat === name || cat.startsWith(name)
+				);
+				if (idx >= 0) next[idx + 1] = false;
+			});
+			return next;
+		});
+	}, []);
+
+	
 
 	// Resize Cornerstone + NiiVue when view mode changes. resize(immediate, keepCamera):
 	// keepCamera defaults to true, which preserved the zoom/pan from a single (fullscreen)
@@ -2744,7 +2794,15 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 				showReportScreen && (
 					<ReportScreen
 						id={caseId}
-						onClose={() => setShowReportScreen(false)}
+						onClose={() => {
+							setShowReportScreen(false);
+							handleClearIsolation();
+							setViewMode("mpr");
+						}}
+						onOrganHighlight={handleOrganHighlight}
+						onClearHighlight={handleClearIsolation}
+						onHideOrgans={handleHideOrgans}
+						onViewChange={(view) => setViewMode(view as ViewMode)}
 					/>
 				)
 			}
