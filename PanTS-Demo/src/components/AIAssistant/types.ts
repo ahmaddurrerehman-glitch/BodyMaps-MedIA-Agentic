@@ -24,6 +24,7 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   timestamp: number;
+  meta?: string;
 }
 
 export interface ViewerStateSnapshot {
@@ -32,6 +33,35 @@ export interface ViewerStateSnapshot {
   windowWidth: number;
   windowCenter: number;
   zoomLevel: number;
+}
+
+export interface OrganMetricSnapshot {
+  organ_name: string;
+  volume_cm3: number | null;
+  mean_hu?: number | null;
+  voxel_count?: number | null;
+  touches_volume_boundary?: boolean;
+}
+
+export interface OrganReferenceSnapshot {
+  organ_name: string;
+  percentile: number;
+  basis?: string | null;
+  n?: number | null;
+}
+
+export interface DemographicsSnapshot {
+  sex?: string | null;
+  age?: number | null;
+  bmi?: number | null;
+  height_cm?: number | null;
+  weight_kg?: number | null;
+}
+
+export interface AIModelInfo {
+  name: string;
+  size?: number;
+  modified_at?: string;
 }
 
 export interface ViewerActions {
@@ -61,5 +91,8 @@ export interface AISidebarProps {
   sessionId?: string;
   availableOrgans: string[];
   viewerState: ViewerStateSnapshot;
+  organMetrics?: OrganMetricSnapshot[];
+  organReferences?: OrganReferenceSnapshot[];
+  demographics?: DemographicsSnapshot | null;
   actions: ViewerActions;
 }
