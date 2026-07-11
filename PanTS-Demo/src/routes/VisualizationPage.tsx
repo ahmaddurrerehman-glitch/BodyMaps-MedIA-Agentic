@@ -1306,7 +1306,7 @@ function VisualizationPage() {
 			cancelAnimationFrame(raf1);
 			cancelAnimationFrame(raf2);
 		};
-	}, [viewMode, layoutPreset, renderingEngine, NV, viewportIds]);
+	}, [viewMode, layoutPreset, showAISidebar, renderingEngine, NV, viewportIds]);
 
 	// Apply zoom to the Cornerstone viewports whenever the toolbar slider changes.
 	// (Previously ZoomHandle owned this side effect; the slider now lives in the toolbar.)
@@ -1533,17 +1533,33 @@ function VisualizationPage() {
 		loadPercentileContext();
 	};
 
+	const handleToggleAISidebar = () => {
+		const opening = !showAISidebar;
+
+		setShowAISidebar(opening);
+
+		if (opening) {
+			setShowStats(false);
+			setShowMetadata(false);
+			setShowMeasurePanel(false);
+			setShowEditPanel(false);
+			setEditMode(null);
+
+			void loadOrganStats();
+			void loadPercentileContext();
+		}
+};
 
 const aiActions = useMemo(() => buildViewerActions({
-checkBoxData,
-setCheckState,
-setOpacityValue,
-handleWindowChange,
-setViewModeFn: setViewMode,
-setActiveMeasureToolFn: setActiveMeasureTool,
-caseId: String(caseId),
-apiBase: API_BASE,
-}), [checkBoxData, caseId]);
+	checkBoxData,
+	setCheckState,
+	setOpacityValue,
+	handleWindowChange,
+	setViewModeFn: setViewMode,
+	setActiveMeasureToolFn: setActiveMeasureTool,
+	caseId: String(caseId),
+	apiBase: API_BASE,
+}), [checkBoxData, caseId, handleWindowChange]);
 
 const statRows = useMemo(
 () =>
@@ -1558,6 +1574,21 @@ demographics?.age ?? null
 [organStats, organNorms, demographics]
 );
 const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
+
+const aiAvailableOrgans = useMemo(() => {
+	const measuredOrgans = (organStats ?? [])
+		.filter((metric) =>
+			typeof metric.volume_cm3 === "number" &&
+			Number.isFinite(metric.volume_cm3) &&
+			metric.volume_cm3 > 0 &&
+			metric.volume_cm3 !== 999999
+		)
+		.map((metric) => metric.organ_name);
+
+	return measuredOrgans.length > 0
+		? measuredOrgans
+		: checkBoxData.map((organ) => organ.label);
+}, [organStats, checkBoxData]);
 
 	const handleDownloadClick = async () => {
 		const downloadUrl = sessionId
@@ -1629,7 +1660,7 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 
 	return (
 		<div
-			className="VisualizationPage"
+			className={`VisualizationPage${showAISidebar ? " ai-panel-open" : ""}`}
 			style={{
 				display: "flex",
 				overflow: "hidden",
@@ -2330,12 +2361,28 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 											)}
 											{!isDicom && (
 												<button
+													type="button"
 													className={`vp-tool ${showAISidebar ? "vp-tool--active" : ""}`}
-													onClick={() => setShowAISidebar((visible) => !visible)}
-													aria-label="Open BodyMaps AI"
+													onClick={handleToggleAISidebar}
+													aria-label={
+														showAISidebar
+														? "Close BodyMaps AI"
+														: "Open BodyMaps AI"
+													}
+													aria-expanded={showAISidebar}
 												>
-													<span style={{ fontFamily: "var(--vp-mono)", fontSize: "12px", fontWeight: 700 }}>AI</span>
-													<span className="vp-tool__tip">BodyMaps AI</span>
+													<span
+														style={{
+															fontFamily: "var(--vp-mono)",
+															fontSize: "12px",
+															fontWeight: 700,
+														}}
+													>
+														AI
+													</span>
+													<span className="vp-tool__tip">
+														{showAISidebar ? "Close BodyMaps AI" : "BodyMaps AI"}
+													</span>
 												</button>
 											)}
 										</div>
@@ -2750,7 +2797,7 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 				onClose={() => setShowAISidebar(false)}
 				caseId={String(caseId)}
 				sessionId={sessionId}
-				availableOrgans={checkBoxData.map((organ) => organ.label)}
+				availableOrgans={aiAvailableOrgans}
 				viewerState={{
 					view: viewMode,
 					opacity: opacityValue,
@@ -2758,6 +2805,8 @@ const flaggedOrgans = useMemo(() => summarizeOutOfRange(statRows), [statRows]);
 					windowCenter,
 					zoomLevel,
 				}}
+				organMetrics={organStats ?? []}
+				demographics={demographics}
 				actions={aiActions}
 			/>
 			</div>
