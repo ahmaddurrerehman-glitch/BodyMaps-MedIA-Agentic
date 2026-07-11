@@ -6,11 +6,19 @@ from services.auto_segmentor import run_auto_segmentation
 from services.mesh_generation import generate_mesh_manifest, generate_organ_glb_bytes
 from services.inference_job_queue import InferenceJobQueue
 from services.intent_parser import parse_intent
+from services.ollama_client import (
+    DEFAULT_OLLAMA_MODEL,
+    OllamaUnavailable,
+    chat_json,
+    list_ollama_models,
+)
+from services.segmentation_metrics import calculate_session_metrics
 from models.application_session import ApplicationSession
 from models.combined_labels import CombinedLabels
 from models.base import db
 from constants import Constants
 import zipfile
+import json
 import pandas as pd
 
 from pathlib import Path
@@ -1711,38 +1719,1385 @@ def api_random_topk_rotate_norand():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+AI_ALLOWED_ACTION_TYPES = {
+    "isolate_organs",
+    "show_organs",
+    "hide_organs",
+    "focus_organ",
+    "get_organ_metric",
+    "set_opacity",
+    "set_window",
+    "set_window_preset",
+    "set_zoom",
+    "zoom_to_fit",
+    "set_view",
+    "activate_measurement_tool",
+    "clear_measurements",
+    "list_structures",
+    "get_structure_count",
+    "get_largest_structure",
+    "get_smallest_structure",
+}
+AI_ALLOWED_VIEWS = {"mpr", "axial", "sagittal", "coronal", "3d"}
+AI_ALLOWED_PRESETS = {"soft_tissue", "bone", "lung", "liver"}
+AI_ALLOWED_TOOLS = {"distance", "probe", "roi"}
+AI_ALLOWED_METRICS = {"volume_cm3", "mean_hu", "all"}
+
+
+def _ai_norm(value):
+    return " ".join(str(value or "").lower().replace("_", " ").replace(".nii.gz", "").replace(".nii", "").split())
+
+
+def _ai_display(value):
+    text = str(value or "").replace(".nii.gz", "").replace(".nii", "").replace("_", " ").strip()
+    return text.title() if text else "Structure"
+
+
+def _ai_metric_valid(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return np.isfinite(number) and number > 0 and number != 999999
+
+
+def _ai_public_metric(entry):
+    return {
+        "organ_name": str(entry.get("organ_name") or ""),
+        "display_name": _ai_display(entry.get("organ_name")),
+        "volume_cm3": entry.get("volume_cm3"),
+        "mean_hu": entry.get("mean_hu"),
+    }
+
+
+def _ai_load_metrics(case_id, supplied_metrics):
+    """
+    Prefer server-computed segmentation metrics.
+
+    If the server does not have local NIfTI data, use metrics supplied by
+    the frontend. Never allow a missing local file to prevent Ollama from
+    answering general educational questions.
+    """
+
+    identifier = str(case_id or "").strip()
+
+    if identifier and _is_safe_id(identifier):
+        try:
+            if identifier.isdigit():
+                result = get_mask_data_internal(identifier)
+                source = "server_mask_data"
+            else:
+                result = calculate_session_metrics(
+                    identifier,
+                    Constants.SESSIONS_DIR_NAME,
+                )
+                source = "session_mask_data"
+
+            if isinstance(result, dict) and not result.get("error"):
+                raw_metrics = result.get("organ_metrics") or []
+
+                if isinstance(raw_metrics, list):
+                    cleaned = [
+                        _ai_public_metric(item)
+                        for item in raw_metrics
+                        if isinstance(item, dict)
+                    ]
+
+                    if cleaned:
+                        return cleaned, source
+
+        except Exception as error:
+            # Missing local case data should not disable general AI chat.
+            print(
+                "[AI metrics unavailable]",
+                type(error).__name__,
+                str(error),
+            )
+
+    if isinstance(supplied_metrics, list):
+        cleaned = [
+            _ai_public_metric(item)
+            for item in supplied_metrics
+            if isinstance(item, dict)
+        ]
+
+        if cleaned:
+            return cleaned, "frontend_supplied_metrics"
+
+    return [], "unavailable"
+
+
+def _ai_metric_lookup(metrics, available_organs):
+    lookup = {}
+    for entry in metrics:
+        organ_name = entry.get("organ_name")
+        display_name = entry.get("display_name") or _ai_display(organ_name)
+        for key in {organ_name, display_name, _ai_norm(organ_name), _ai_norm(display_name)}:
+            if key:
+                lookup[_ai_norm(key)] = entry
+    for organ in available_organs:
+        key = _ai_norm(organ)
+        if key not in lookup:
+            # Keep the viewer catalog entry available for honest “metric unavailable” responses.
+            lookup[key] = {"organ_name": organ, "display_name": _ai_display(organ), "volume_cm3": None, "mean_hu": None}
+    return lookup
+
+
+def _ai_resolve_organ(value, available_organs):
+    norm = _ai_norm(value)
+    if not norm:
+        return None
+
+    normalized_available = [(organ, _ai_norm(organ)) for organ in available_organs]
+    for organ, organ_norm in normalized_available:
+        if norm == organ_norm:
+            return organ
+    for organ, organ_norm in normalized_available:
+        if norm in organ_norm or organ_norm in norm:
+            return organ
+
+    alias_groups = [
+        {"left kidney", "kidney left", "left renal", "left renal kidney"},
+        {"right kidney", "kidney right", "right renal", "right renal kidney"},
+        {"gall bladder", "gallbladder"},
+        {"inferior vena cava", "ivc", "vena cava", "postcava"},
+        {"superior mesenteric artery", "sma"},
+        {"common bile duct", "bile duct", "cbd"},
+        {"left adrenal", "left adrenal gland", "adrenal gland left"},
+        {"right adrenal", "right adrenal gland", "adrenal gland right"},
+    ]
+    for aliases in alias_groups:
+        normalized_aliases = {_ai_norm(alias) for alias in aliases}
+        if norm not in normalized_aliases:
+            continue
+        for organ, organ_norm in normalized_available:
+            if organ_norm in normalized_aliases:
+                return organ
+    return None
+
+
+def _ai_sanitize_actions(actions, available_organs):
+    if not isinstance(actions, list):
+        return []
+    sanitized = []
+    seen = set()
+    for action in actions[:8]:
+        if not isinstance(action, dict):
+            continue
+        action_type = action.get("type")
+        if action_type not in AI_ALLOWED_ACTION_TYPES:
+            continue
+        clean = {"type": action_type}
+        if action_type in {"isolate_organs", "show_organs", "hide_organs"}:
+            organs = action.get("organs")
+            if not isinstance(organs, list):
+                continue
+            resolved = []
+            for organ in organs:
+                found = _ai_resolve_organ(organ, available_organs)
+                if found and found not in resolved:
+                    resolved.append(found)
+            if not resolved:
+                continue
+            clean["organs"] = resolved
+        elif action_type == "focus_organ":
+            found = _ai_resolve_organ(action.get("organ"), available_organs)
+            if not found:
+                continue
+            clean["organ"] = found
+        elif action_type == "get_organ_metric":
+            found = _ai_resolve_organ(action.get("organ"), available_organs)
+            if not found:
+                continue
+            metric = action.get("metric") or "volume_cm3"
+            if metric not in AI_ALLOWED_METRICS:
+                metric = "volume_cm3"
+            clean["organ"] = found
+            clean["metric"] = metric
+        elif action_type == "set_opacity":
+            try:
+                clean["value"] = max(0, min(100, float(action.get("value"))))
+            except (TypeError, ValueError):
+                continue
+        elif action_type == "set_window":
+            try:
+                clean["width"] = max(1, float(action.get("width")))
+                clean["center"] = float(action.get("center"))
+            except (TypeError, ValueError):
+                continue
+        elif action_type == "set_window_preset":
+            preset = action.get("preset")
+            if preset not in AI_ALLOWED_PRESETS:
+                continue
+            clean["preset"] = preset
+        elif action_type == "set_zoom":
+            try:
+                clean["value"] = max(0.1, min(20, float(action.get("value"))))
+            except (TypeError, ValueError):
+                continue
+        elif action_type == "set_view":
+            view = action.get("view")
+            if view not in AI_ALLOWED_VIEWS:
+                continue
+            clean["view"] = view
+        elif action_type == "activate_measurement_tool":
+            tool = action.get("tool")
+            if tool not in AI_ALLOWED_TOOLS:
+                continue
+            clean["tool"] = tool
+
+        key = json.dumps(clean, sort_keys=True)
+        if key not in seen:
+            sanitized.append(clean)
+            seen.add(key)
+    return sanitized
+
+
+def _ai_action_family(action_type):
+    if action_type in {"isolate_organs", "show_organs", "hide_organs", "focus_organ"}:
+        return "organ_visibility"
+    if action_type in {"set_window", "set_window_preset"}:
+        return "window"
+    if action_type in {"set_zoom", "zoom_to_fit"}:
+        return "zoom"
+    if action_type in {"activate_measurement_tool", "clear_measurements"}:
+        return "measurement_tool"
+    if action_type in {"list_structures", "get_structure_count", "get_largest_structure", "get_smallest_structure"}:
+        return "structure_query"
+    return action_type
+
+
+def _ai_merge_actions(deterministic_actions, model_actions):
+    """Prefer deterministic actions for recognized commands and let Ollama fill gaps."""
+    merged = []
+    seen = set()
+    used_families = set()
+    for action in [*(deterministic_actions or []), *(model_actions or [])]:
+        if not isinstance(action, dict):
+            continue
+        key = json.dumps(action, sort_keys=True)
+        if key in seen:
+            continue
+        family = _ai_action_family(action.get("type"))
+        # A command should not apply conflicting visibility/window/zoom/tool actions.
+        if family in used_families and family != "get_organ_metric":
+            continue
+        merged.append(action)
+        seen.add(key)
+        used_families.add(family)
+    return merged[:8]
+
+
+def _ai_metadata(case_id, supplied):
+    metadata = {}
+    if isinstance(supplied, dict):
+        for key in ["sex", "age", "bmi", "height_cm", "weight_kg"]:
+            if supplied.get(key) not in [None, ""]:
+                metadata[key] = supplied.get(key)
+    if case_id and str(case_id).isdigit():
+        entry = _METADATA_CACHE.get(get_panTS_id(str(case_id)), {})
+        if entry.get("age") not in [None, ""]:
+            try:
+                metadata["age"] = float(entry.get("age"))
+            except (TypeError, ValueError):
+                metadata["age"] = entry.get("age")
+        if entry.get("sex") not in [None, ""]:
+            metadata["sex"] = entry.get("sex")
+    if "bmi" not in metadata:
+        try:
+            height_m = float(metadata.get("height_cm")) / 100
+            weight_kg = float(metadata.get("weight_kg"))
+            if height_m > 0 and weight_kg > 0:
+                metadata["bmi"] = round(weight_kg / (height_m * height_m), 1)
+        except (TypeError, ValueError):
+            pass
+    return metadata
+
+
+def _ai_has_case_reference(norm: str) -> bool:
+    case_phrases = (
+        "this scan",
+        "this ct",
+        "this case",
+        "this patient",
+        "this segmentation",
+        "the segmentation",
+        "current scan",
+        "current case",
+        "currently loaded",
+        "shown here",
+        "in the viewer",
+        "in this image",
+        "in these images",
+        "my scan",
+        "my ct",
+        "my liver",
+        "my pancreas",
+        "my kidney",
+        "my spleen",
+        "do i have",
+        "am i",
+        "for this patient",
+        "patient s",
+        "patient's",
+    )
+
+    return any(phrase in norm for phrase in case_phrases)
+
+
+def _ai_question_mode(message, fallback_actions):
+    """
+    Separate general knowledge from case-specific questions.
+
+    Modes:
+    - general_education
+    - case_metadata
+    - case_measurement
+    - case_health_context
+    - viewer_command
+    """
+
+    norm = _ai_norm(message)
+    action_types = {
+        action.get("type")
+        for action in (fallback_actions or [])
+        if isinstance(action, dict)
+    }
+
+    viewer_action_types = {
+        "isolate_organs",
+        "show_organs",
+        "hide_organs",
+        "focus_organ",
+        "set_opacity",
+        "set_window",
+        "set_window_preset",
+        "set_zoom",
+        "zoom_to_fit",
+        "set_view",
+        "activate_measurement_tool",
+        "clear_measurements",
+    }
+
+    if action_types.intersection(viewer_action_types):
+        return "viewer_command"
+
+    has_case_reference = _ai_has_case_reference(norm)
+
+    if "bmi" in norm or "body mass index" in norm:
+        case_bmi_phrases = (
+            "patient bmi",
+            "patient s bmi",
+            "patient's bmi",
+            "this bmi",
+            "their bmi",
+            "his bmi",
+            "her bmi",
+            "my bmi",
+            "bmi for this",
+            "bmi of this",
+        )
+
+        if has_case_reference or any(
+            phrase in norm for phrase in case_bmi_phrases
+        ):
+            return "case_metadata"
+
+        return "general_education"
+
+    if "age" in norm or "how old" in norm:
+        if has_case_reference or "patient age" in norm:
+            return "case_metadata"
+
+    health_terms = (
+        "healthy",
+        "unhealthy",
+        "normal",
+        "abnormal",
+        "concerning",
+        "disease",
+        "diseased",
+        "cancer",
+        "cancerous",
+        "tumor",
+        "malignant",
+        "benign",
+        "enlarged",
+        "too large",
+        "too small",
+        "swollen",
+        "damaged",
+        "cirrhosis",
+        "fatty liver",
+        "lesion",
+        "mass",
+    )
+
+    health_question = any(
+        term in norm for term in health_terms
+    )
+
+    implied_current_case = (
+        norm.startswith("is the liver ")
+        or norm.startswith("is the pancreas ")
+        or norm.startswith("is the spleen ")
+        or norm.startswith("is the kidney ")
+        or norm.startswith("does the liver look ")
+    )
+
+    if health_question and (
+        has_case_reference or implied_current_case
+    ):
+        return "case_health_context"
+
+    measurement_terms = (
+        "volume",
+        "how big",
+        "what size",
+        "size of",
+        "mean hu",
+        "hounsfield",
+        "largest structure",
+        "smallest structure",
+        "how many structures",
+        "structure count",
+        "measured",
+    )
+
+    asks_measurement = any(
+        term in norm for term in measurement_terms
+    )
+
+    general_reference_terms = (
+        "normal liver volume",
+        "normal organ volume",
+        "typical liver volume",
+        "average liver volume",
+        "usual liver size",
+        "what is considered normal",
+    )
+
+    if asks_measurement:
+        if (
+            any(term in norm for term in general_reference_terms)
+            and not has_case_reference
+        ):
+            return "general_education"
+
+        return "case_measurement"
+
+    return "general_education"
+
+
+def _ai_case_metadata_reply(norm, metadata):
+    """
+    Answer only explicitly case-specific age/BMI questions.
+
+    General questions such as 'What is BMI?' must continue to Ollama.
+    """
+
+    has_case_reference = _ai_has_case_reference(norm)
+
+    asks_case_age = (
+        ("age" in norm or "how old" in norm)
+        and (
+            has_case_reference
+            or "patient age" in norm
+            or "age of the patient" in norm
+        )
+    )
+
+    if asks_case_age:
+        if metadata.get("age") not in [None, ""]:
+            age = metadata.get("age")
+
+            try:
+                age = round(float(age))
+            except (TypeError, ValueError):
+                pass
+
+            return (
+                "The available metadata lists this patient's age "
+                f"as **{age} years**."
+            )
+
+        return (
+            "The current case metadata does not include a valid age."
+        )
+
+    asks_case_bmi = (
+        ("bmi" in norm or "body mass index" in norm)
+        and (
+            has_case_reference
+            or "patient bmi" in norm
+            or "patient's bmi" in norm
+            or "bmi of the patient" in norm
+            or "bmi for the patient" in norm
+        )
+    )
+
+    if asks_case_bmi:
+        if metadata.get("bmi") not in [None, ""]:
+            try:
+                bmi = float(metadata.get("bmi"))
+                return (
+                    "The available metadata lists this patient's BMI "
+                    f"as **{bmi:.1f}**."
+                )
+            except (TypeError, ValueError):
+                pass
+
+        return (
+            "The current case does not include enough height and weight "
+            "information to calculate the patient's BMI."
+        )
+
+    return None
+
+
+def _ai_relevant_metrics(message, metrics):
+    norm = _ai_norm(message)
+    relevant = []
+
+    for entry in metrics or []:
+        if not isinstance(entry, dict):
+            continue
+
+        organ_name = entry.get("organ_name")
+        display_name = (
+            entry.get("display_name")
+            or _ai_display(organ_name)
+        )
+
+        names = {
+            _ai_norm(organ_name),
+            _ai_norm(display_name),
+        }
+
+        if any(name and name in norm for name in names):
+            relevant.append(entry)
+
+    return relevant
+
+
+def _ai_case_facts(message, metrics, metadata):
+    """
+    Produce exact deterministic facts that can be placed beside the model's
+    health-context explanation.
+    """
+
+    facts = []
+    relevant_metrics = _ai_relevant_metrics(
+        message,
+        metrics,
+    )
+
+    for entry in relevant_metrics:
+        organ = (
+            entry.get("display_name")
+            or _ai_display(entry.get("organ_name"))
+        )
+
+        volume = entry.get("volume_cm3")
+        mean_hu = entry.get("mean_hu")
+
+        organ_facts = []
+
+        if _ai_metric_valid(volume):
+            organ_facts.append(
+                f"segmented volume {float(volume):.2f} cm³"
+            )
+
+        if _ai_metric_valid(mean_hu) or mean_hu == 0:
+            organ_facts.append(
+                f"mean attenuation {float(mean_hu):.1f} HU"
+            )
+
+        if organ_facts:
+            facts.append(
+                f"**{organ}:** " + ", ".join(organ_facts)
+            )
+
+    if metadata.get("age") not in [None, ""]:
+        facts.append(f"**Age:** {metadata.get('age')}")
+
+    if metadata.get("sex") not in [None, ""]:
+        facts.append(f"**Sex:** {metadata.get('sex')}")
+
+    if metadata.get("bmi") not in [None, ""]:
+        facts.append(f"**BMI:** {metadata.get('bmi')}")
+
+    return facts
+
+
+def _ai_extract_unknown_volume_request(norm, metric_lookup):
+    if "volume" not in norm and "how big" not in norm and "size" not in norm:
+        return None
+    for key, entry in metric_lookup.items():
+        if key and key in norm:
+            return entry
+    # A small deny-list for common out-of-scope organs people may ask about.
+    for organ in ["brain", "heart", "eye", "skull"]:
+        if organ in norm:
+            return {"organ_name": organ, "display_name": _ai_display(organ), "volume_cm3": None, "mean_hu": None, "missing": True}
+    return None
+
+
+def _ai_action_prefix(actions):
+    bits = []
+    if any(a.get("type") == "set_view" and a.get("view") == "3d" for a in actions):
+        bits.append("switched to 3D")
+    isolate = next((a for a in actions if a.get("type") == "isolate_organs"), None)
+    if isolate:
+        bits.append("isolated " + ", ".join(_ai_display(o) for o in isolate.get("organs", [])))
+    elif any(a.get("type") == "show_organs" for a in actions):
+        show = next(a for a in actions if a.get("type") == "show_organs")
+        bits.append("showed " + ", ".join(_ai_display(o) for o in show.get("organs", [])))
+    if any(a.get("type") == "focus_organ" for a in actions):
+        focus = next(a for a in actions if a.get("type") == "focus_organ")
+        bits.append("focused on " + _ai_display(focus.get("organ")))
+    if bits:
+        if len(bits) == 1:
+            return "I " + bits[0] + ". "
+        return "I " + ", ".join(bits[:-1]) + ", and " + bits[-1] + ". "
+    return ""
+
+
+def _ai_structure_names(metrics, available_organs):
+    raw_names = [m.get("organ_name") for m in metrics if m.get("organ_name")]
+    if not raw_names:
+        raw_names = available_organs
+    names = []
+    seen = set()
+    for name in raw_names:
+        display = _ai_display(name)
+        key = _ai_norm(display)
+        if key and key not in seen:
+            names.append(display)
+            seen.add(key)
+    return names
+
+
+def _ai_action_confirmation(actions):
+    confirmations = []
+    for action in actions:
+        action_type = action.get("type")
+        if action_type == "isolate_organs":
+            confirmations.append("Isolated " + ", ".join(_ai_display(o) for o in action.get("organs", [])) + ".")
+        elif action_type == "show_organs":
+            confirmations.append("Showed " + ", ".join(_ai_display(o) for o in action.get("organs", [])) + ".")
+        elif action_type == "hide_organs":
+            confirmations.append("Hid " + ", ".join(_ai_display(o) for o in action.get("organs", [])) + ".")
+        elif action_type == "focus_organ":
+            confirmations.append("Focused on " + _ai_display(action.get("organ")) + ".")
+        elif action_type == "set_view":
+            confirmations.append(f"Switched to {str(action.get('view')).upper()} view.")
+        elif action_type == "set_opacity":
+            confirmations.append(f"Set overlay opacity to {float(action.get('value')):.0f}%.")
+        elif action_type == "set_window_preset":
+            confirmations.append(f"Applied the {str(action.get('preset')).replace('_', ' ')} window preset.")
+        elif action_type == "set_window":
+            confirmations.append(f"Set the CT window to width {float(action.get('width')):.0f} and center {float(action.get('center')):.0f}.")
+        elif action_type == "set_zoom":
+            confirmations.append(f"Set zoom to {float(action.get('value')):g}.")
+        elif action_type == "zoom_to_fit":
+            confirmations.append("Reset zoom to fit.")
+        elif action_type == "activate_measurement_tool":
+            confirmations.append(f"Activated the {str(action.get('tool')).upper()} tool.")
+        elif action_type == "clear_measurements":
+            confirmations.append("Cleared the current measurements.")
+    return " ".join(confirmations)
+
+
+def _ai_grounded_reply(
+    message,
+    actions,
+    metrics,
+    available_organs,
+    metadata,
+    candidate_reply,
+    question_mode,
+):
+    norm = _ai_norm(message)
+    metric_lookup = _ai_metric_lookup(
+        metrics,
+        available_organs,
+    )
+
+    # Only intercept age/BMI when the user explicitly asks about
+    # the currently loaded patient.
+    if question_mode == "case_metadata":
+        metadata_reply = _ai_case_metadata_reply(
+            norm,
+            metadata,
+        )
+
+        if metadata_reply:
+            return metadata_reply
+
+    # For health questions, preserve Ollama's explanation while placing
+    # exact measured case facts above it.
+    if question_mode == "case_health_context":
+        facts = _ai_case_facts(
+            message,
+            metrics,
+            metadata,
+        )
+
+        if (
+            isinstance(candidate_reply, str)
+            and candidate_reply.strip()
+        ):
+            explanation = candidate_reply.strip()
+        else:
+            explanation = (
+                "The available segmentation measurements can provide "
+                "useful context, but they are not enough by themselves "
+                "to determine whether this organ is healthy. A complete "
+                "assessment would also consider the CT appearance, "
+                "attenuation, enhancement, contour, focal lesions, "
+                "clinical history, and relevant laboratory results."
+            )
+
+        if facts:
+            reply = (
+                "Available measurements for this case:\n"
+                + "\n".join(f"- {fact}" for fact in facts)
+                + "\n\n"
+                + explanation
+            )
+        else:
+            reply = explanation
+
+        uncertainty_terms = (
+            "not a diagnosis",
+            "cannot confirm",
+            "cannot determine",
+            "volume alone",
+            "measurements alone",
+            "radiologist",
+            "clinical evaluation",
+        )
+
+        if not any(
+            term in explanation.lower()
+            for term in uncertainty_terms
+        ):
+            reply += (
+                "\n\nThis is an educational, non-diagnostic assessment. "
+                "Volume and segmentation measurements alone cannot "
+                "confirm that an organ is healthy or diagnose disease."
+            )
+
+        confirmation = _ai_action_confirmation(actions)
+
+        if confirmation:
+            reply += "\n\n" + confirmation
+
+        return reply
+
+    # Deterministically ground exact case measurements.
+    for action in actions:
+        if action.get("type") != "get_organ_metric":
+            continue
+
+        entry = metric_lookup.get(
+            _ai_norm(action.get("organ"))
+        )
+
+        organ_label = _ai_display(
+            action.get("organ")
+        )
+
+        if not entry or entry.get("missing"):
+            return (
+                f"{organ_label} is not available in this segmentation, "
+                f"so no {organ_label.lower()} measurement is available "
+                "for this case."
+            )
+
+        metric = action.get("metric") or "volume_cm3"
+        volume = entry.get("volume_cm3")
+        mean_hu = entry.get("mean_hu")
+        prefix = _ai_action_prefix(actions)
+
+        if metric == "mean_hu":
+            if _ai_metric_valid(mean_hu) or mean_hu == 0:
+                return (
+                    f"{prefix}The segmented **{organ_label}** mean "
+                    f"attenuation is **{float(mean_hu):.1f} HU**, "
+                    "measured from the segmentation mask."
+                )
+
+            return (
+                f"{prefix}Mean HU for **{organ_label}** is not "
+                "available for this case."
+            )
+
+        if metric == "all":
+            parts = []
+
+            if _ai_metric_valid(volume):
+                parts.append(
+                    f"volume **{float(volume):.2f} cm³**"
+                )
+
+            if _ai_metric_valid(mean_hu) or mean_hu == 0:
+                parts.append(
+                    f"mean attenuation "
+                    f"**{float(mean_hu):.1f} HU**"
+                )
+
+            if parts:
+                return (
+                    f"{prefix}For the segmented **{organ_label}**, "
+                    + " and ".join(parts)
+                    + "."
+                )
+
+            return (
+                f"{prefix}Metrics for **{organ_label}** are not "
+                "available for this case."
+            )
+
+        if _ai_metric_valid(volume):
+            return (
+                f"{prefix}The segmented **{organ_label}** volume is "
+                f"**{float(volume):.2f} cm³**, measured from the "
+                "segmentation mask."
+            )
+
+        return (
+            f"{prefix}No valid segmented volume is available for "
+            f"**{organ_label}** in this case."
+        )
+
+    if any(
+        action.get("type") == "get_largest_structure"
+        for action in actions
+    ):
+        valid = [
+            metric
+            for metric in metrics
+            if _ai_metric_valid(metric.get("volume_cm3"))
+        ]
+
+        if valid:
+            largest = max(
+                valid,
+                key=lambda item: float(
+                    item.get("volume_cm3")
+                ),
+            )
+
+            return (
+                "The largest segmented structure is "
+                f"**{_ai_display(largest.get('organ_name'))}**, "
+                "with a measured volume of "
+                f"**{float(largest.get('volume_cm3')):.2f} cm³**."
+            )
+
+        return (
+            "I could not determine the largest structure because valid "
+            "volume metrics are unavailable for this case."
+        )
+
+    if any(
+        action.get("type") == "get_smallest_structure"
+        for action in actions
+    ):
+        valid = [
+            metric
+            for metric in metrics
+            if _ai_metric_valid(metric.get("volume_cm3"))
+        ]
+
+        if valid:
+            smallest = min(
+                valid,
+                key=lambda item: float(
+                    item.get("volume_cm3")
+                ),
+            )
+
+            return (
+                "The smallest segmented structure is "
+                f"**{_ai_display(smallest.get('organ_name'))}**, "
+                "with a measured volume of "
+                f"**{float(smallest.get('volume_cm3')):.2f} cm³**."
+            )
+
+        return (
+            "I could not determine the smallest structure because valid "
+            "volume metrics are unavailable for this case."
+        )
+
+    if any(
+        action.get("type") == "get_structure_count"
+        for action in actions
+    ):
+        names = _ai_structure_names(
+            metrics,
+            available_organs,
+        )
+
+        return (
+            f"This case has **{len(names)} segmented structures** "
+            "listed for the viewer."
+        )
+
+    if any(
+        action.get("type") == "list_structures"
+        for action in actions
+    ):
+        names = _ai_structure_names(
+            metrics,
+            available_organs,
+        )
+
+        if names:
+            return (
+                f"This case includes **{len(names)} segmented "
+                "structures**: "
+                + ", ".join(names)
+                + "."
+            )
+
+        return (
+            "No segmented structures are listed for this case."
+        )
+
+    unknown_volume = _ai_extract_unknown_volume_request(
+        norm,
+        metric_lookup,
+    )
+
+    if unknown_volume and unknown_volume.get("missing"):
+        organ_name = _ai_display(
+            unknown_volume.get("organ_name")
+        )
+
+        return (
+            f"The **{organ_name}** is not included in this abdominal "
+            f"segmentation, so no {organ_name.lower()} volume is "
+            "available for this case."
+        )
+
+    confirmation = _ai_action_confirmation(actions)
+
+    if (
+        isinstance(candidate_reply, str)
+        and candidate_reply.strip()
+    ):
+        reply = candidate_reply.strip()
+
+        if confirmation:
+            reply += "\n\n" + confirmation
+
+        return reply
+
+    if confirmation:
+        return confirmation
+
+    return (
+        "I could not generate a complete response. Please verify that "
+        "Ollama is running and that the selected model is installed."
+    )
+
+
+def _ai_system_prompt():
+    return """
+You are BodyMaps AI, a capable and conversational assistant embedded in
+an abdominal CT visualization application.
+
+Your job is to answer the user's actual question. Do not assume that
+every question asks about the current patient.
+
+You operate in several modes.
+
+GENERAL EDUCATIONAL QUESTIONS
+Answer ordinary questions using your general knowledge.
+
+Examples:
+- What is a CT scan?
+- What is body mass index?
+- What does the liver do?
+- What are Hounsfield units?
+- What is a segmentation mask?
+- What conditions can affect the liver?
+- What is a typical liver volume?
+
+These questions do not require patient metadata. Answer them naturally,
+clearly, and conversationally.
+
+CASE-SPECIFIC MEASUREMENTS
+When the user asks about this scan, this case, this patient, the current
+segmentation, or a measured structure, use the supplied case data.
+
+Examples:
+- What is the liver volume in this scan?
+- How big is the segmented pancreas?
+- What is this patient's BMI?
+- Which segmented structure is largest?
+
+Never invent a case-specific value. Use exact supplied values.
+
+CASE-SPECIFIC HEALTH QUESTIONS
+When the user asks questions such as:
+- Is this liver healthy?
+- Does this liver appear enlarged?
+- Is this organ normal?
+- Is this finding concerning?
+- Could this be a tumor?
+
+Provide a useful evidence-limited assessment rather than a generic
+refusal.
+
+You should:
+1. State the exact available case measurements.
+2. Explain what those measurements may suggest.
+3. Compare them with broad educational expectations when appropriate,
+   while clearly labeling those comparisons as approximate.
+4. Explain important limitations of the available evidence.
+5. State what additional imaging features, metadata, laboratory values,
+   symptoms, or clinical history would normally be considered.
+
+Do not state that a patient definitely has or does not have a disease
+when the supplied data does not establish that conclusion.
+
+Volume alone does not prove that an organ is healthy or unhealthy.
+A segmented volume can provide useful context, but complete assessment
+may also require contour, attenuation, contrast enhancement, focal
+lesions, surrounding structures, prior scans, laboratory results, and
+clinical history.
+
+You may explain possible diseases and general treatment approaches.
+Do not prescribe medication, choose a personalized treatment, or tell
+the user to ignore professional medical care.
+
+VIEWER COMMANDS
+Translate viewer requests into the allowed structured actions.
+Actions are applied immediately and should not require confirmation.
+
+GROUNDING RULES
+- Never invent organ volume, mean HU, age, BMI, or patient metadata.
+- General medical and imaging knowledge does not need to be present in
+  the case metadata.
+- Patient-specific facts must come from supplied data.
+- If case measurements are unavailable, say which data is missing and
+  still answer the educational portion of the question.
+- "Segment the liver" means display or isolate an existing segmentation.
+  Do not claim a new segmentation model was run unless the backend
+  actually reports that it ran.
+
+OUTPUT FORMAT
+Return exactly one JSON object:
+
+{
+  "reply": "complete conversational answer",
+  "actions": [],
+  "intent": "short_intent_name"
+}
+
+Allowed actions:
+- {"type":"isolate_organs","organs":["exact available organ name"]}
+- {"type":"show_organs","organs":["exact available organ name"]}
+- {"type":"hide_organs","organs":["exact available organ name"]}
+- {"type":"focus_organ","organ":"exact available organ name"}
+- {"type":"get_organ_metric","organ":"exact available organ name","metric":"volume_cm3|mean_hu|all"}
+- {"type":"list_structures"}
+- {"type":"get_structure_count"}
+- {"type":"get_largest_structure"}
+- {"type":"get_smallest_structure"}
+- {"type":"set_view","view":"mpr|axial|sagittal|coronal|3d"}
+- {"type":"set_opacity","value":0-100}
+- {"type":"set_window","width":number,"center":number}
+- {"type":"set_window_preset","preset":"soft_tissue|bone|lung|liver"}
+- {"type":"set_zoom","value":number}
+- {"type":"zoom_to_fit"}
+- {"type":"activate_measurement_tool","tool":"distance|probe|roi"}
+- {"type":"clear_measurements"}
+
+For a question that does not need a viewer action, return an empty
+actions list.
+
+Return JSON only.
+""".strip()
+
+
+@api_blueprint.route("/ai-models", methods=["GET"])
+def ai_models():
+    try:
+        models = list_ollama_models()
+        model_names = [model["name"] for model in models]
+        default_model = DEFAULT_OLLAMA_MODEL if DEFAULT_OLLAMA_MODEL in model_names else (model_names[0] if model_names else DEFAULT_OLLAMA_MODEL)
+        return jsonify({
+            "available": True,
+            "models": models,
+            "default_model": default_model,
+        })
+    except OllamaUnavailable as error:
+        return jsonify({
+            "available": False,
+            "models": [],
+            "default_model": DEFAULT_OLLAMA_MODEL,
+            "error": f"Ollama is not reachable at the configured local endpoint: {error}",
+        }), 200
+
+
 @api_blueprint.route("/ai-command", methods=["POST"])
 def ai_command():
     try:
-        body = request.get_json(force=True, silent=True) or {}
-        message = (body.get("message") or "").strip()
+        body = request.get_json(
+            force=True,
+            silent=True,
+        ) or {}
+
+        message = str(
+            body.get("message") or ""
+        ).strip()
+
         if not message:
-            return jsonify({
-                "reply": "Please type a question or viewer command.",
-                "actions": [],
-                "source": "hardcoded",
-            }), 400
-        available_organs = body.get("available_organs") or []
+            return jsonify(
+                {
+                    "reply": (
+                        "Please type a question or viewer command."
+                    ),
+                    "actions": [],
+                    "source": "validation",
+                }
+            ), 400
+
+        available_organs = body.get(
+            "available_organs"
+        ) or []
+
         if not isinstance(available_organs, list):
             available_organs = []
-        viewer_state = body.get("viewer_state") or {}
-        case_id = str(body.get("case_id") or body.get("session_id") or "")
-        result = parse_intent(
+
+        available_organs = [
+            str(item).strip()
+            for item in available_organs
+            if str(item).strip()
+        ]
+
+        viewer_state = (
+            body.get("viewer_state")
+            if isinstance(
+                body.get("viewer_state"),
+                dict,
+            )
+            else {}
+        )
+
+        case_id = str(
+            body.get("session_id")
+            or body.get("case_id")
+            or ""
+        ).strip()
+
+        requested_model = body.get("model")
+
+        # Always use the configured default when the frontend does not
+        # explicitly send a model.
+        selected_model = (
+            requested_model.strip()
+            if isinstance(requested_model, str)
+            and requested_model.strip()
+            else DEFAULT_OLLAMA_MODEL
+        )
+
+        metrics, metric_source = _ai_load_metrics(
+            case_id,
+            body.get("organ_metrics"),
+        )
+
+        metadata = _ai_metadata(
+            case_id,
+            body.get("demographics"),
+        )
+
+        # Include metric organ names even if the frontend organ catalog
+        # was empty or incomplete.
+        for metric in metrics:
+            organ_name = str(
+                metric.get("organ_name") or ""
+            ).strip()
+
+            if (
+                organ_name
+                and organ_name not in available_organs
+            ):
+                available_organs.append(organ_name)
+
+        fallback = parse_intent(
             message=message,
             available_organs=available_organs,
             viewer_state=viewer_state,
             case_id=case_id or None,
         )
-        return jsonify(result)
+
+        fallback_actions = _ai_sanitize_actions(
+            fallback.get("actions", []),
+            available_organs,
+        )
+
+        question_mode = _ai_question_mode(
+            message,
+            fallback_actions,
+        )
+
+        # Do not use the fallback's medical refusal as the model's answer.
+        # The model receives the fallback only as an action suggestion.
+        rule_suggestion_reply = None
+
+        if question_mode in {
+            "viewer_command",
+            "case_measurement",
+        }:
+            rule_suggestion_reply = fallback.get("reply")
+
+        prompt_payload = {
+            "request_mode": question_mode,
+            "user_message": message,
+            "current_case": {
+                "case_id": case_id or None,
+                "available_organs": available_organs,
+                "computed_organ_metrics": metrics,
+                "metadata": metadata,
+                "metrics_source": metric_source,
+            },
+            "viewer_state": viewer_state,
+            "rule_based_suggestion": {
+                "reply": rule_suggestion_reply,
+                "actions": fallback_actions,
+                "intent": fallback.get("intent"),
+            },
+            "response_requirements": {
+                "answer_general_questions_using_model_knowledge": True,
+                "use_exact_case_values_when_case_specific": True,
+                "do_not_invent_patient_specific_values": True,
+                "provide_non_diagnostic_health_context": True,
+                "return_json_only": True,
+            },
+        }
+
+        model_result = None
+        model_error = None
+        source = "ollama"
+
+        try:
+            model_result = chat_json(
+                model=selected_model,
+                system_prompt=_ai_system_prompt(),
+                user_prompt=json.dumps(
+                    prompt_payload,
+                    ensure_ascii=False,
+                ),
+                temperature=0.2,
+            )
+        except (
+            OllamaUnavailable,
+            Exception,
+        ) as error:
+            # Keep viewer actions usable if Ollama is temporarily offline.
+            model_error = str(error)
+            model_result = None
+            source = "rule_fallback"
+
+            print(
+                "[Ollama unavailable]",
+                type(error).__name__,
+                model_error,
+            )
+
+        if isinstance(model_result, dict):
+            model_actions = _ai_sanitize_actions(
+                model_result.get("actions", []),
+                available_organs,
+            )
+
+            actions = _ai_merge_actions(
+                fallback_actions,
+                model_actions,
+            )
+
+            candidate_reply = (
+                model_result.get("reply")
+                or rule_suggestion_reply
+            )
+
+            intent = (
+                model_result.get("intent")
+                or fallback.get("intent")
+                or question_mode
+            )
+        else:
+            actions = fallback_actions
+            candidate_reply = rule_suggestion_reply
+            intent = (
+                fallback.get("intent")
+                or question_mode
+            )
+
+        reply = _ai_grounded_reply(
+            message=message,
+            actions=actions,
+            metrics=metrics,
+            available_organs=available_organs,
+            metadata=metadata,
+            candidate_reply=candidate_reply,
+            question_mode=question_mode,
+        )
+
+        response = {
+            "reply": reply,
+            "actions": actions,
+            "grounding": {
+                "case_id": case_id,
+                "request_mode": question_mode,
+                "metrics_source": metric_source,
+                "organ_count": (
+                    len(metrics)
+                    if metrics
+                    else len(available_organs)
+                ),
+                "metadata_fields": sorted(
+                    metadata.keys()
+                ),
+            },
+            "source": source,
+            "model": (
+                selected_model
+                if source == "ollama"
+                else None
+            ),
+            "intent": intent,
+        }
+
+        if model_error:
+            response["ollama_error"] = model_error
+
+        return jsonify(response)
+
     except Exception as error:
-        print("[ai_command error]", type(error).__name__)
-        return jsonify({
-            "reply": "An internal error occurred while processing the AI command.",
-            "actions": [],
-            "source": "error",
-        }), 500
+        print(
+            "[ai_command error]",
+            type(error).__name__,
+            str(error),
+        )
 
-
+        return jsonify(
+            {
+                "reply": (
+                    "An internal error occurred while processing "
+                    "the AI request."
+                ),
+                "actions": [],
+                "source": "error",
+                "error_type": type(error).__name__,
+            }
+        ), 500
 
 # ---------------------------------------------------------------------------
 # Edited segmentation masks (viewer's Edit Masks panel).
