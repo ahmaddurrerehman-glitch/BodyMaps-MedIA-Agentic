@@ -1,5 +1,5 @@
 import { cache, init as coreInit, utilities as csCoreUtils, Enums, eventTarget, getRenderingEngine, imageLoader, metaData, RenderingEngine, setVolumesForViewports, volumeLoader } from "@cornerstonejs/core";
-import type { ColorLUT, Point2, Point3 } from "@cornerstonejs/core/types";
+import type { ColorLUT, Point2, Point3, Color } from "@cornerstonejs/core/types";
 import { cornerstoneNiftiImageLoader, createNiftiImageIdsAndCacheMetadata, init as niftiImageLoaderInit } from "@cornerstonejs/nifti-volume-loader";
 import * as cornerstoneTools from '@cornerstonejs/tools';
 import { init as cornerstoneToolsInit } from '@cornerstonejs/tools';
@@ -723,15 +723,6 @@ export function getCustomSegmentLabelsForExport(): Record<number, CustomLabelEnt
   return out;
 }
 
-// Repopulate custom labels from a saved sidecar (called after loading a case with
-// previously-saved edits)
-export function restoreCustomSegmentLabels(entries: Record<number, CustomLabelEntry>) {
-  for (const [idxStr, entry] of Object.entries(entries)) {
-    const idx = Number(idxStr);
-    _customSegmentLabels[idx] = entry.name;
-    registerNewSegmentColor(idx, entry.color);
-  }
-}
 
 function _ensureColorLutSlot(segmentIndex: number, color: Color) {
   if (!_lastColorLUT) return;
@@ -1674,7 +1665,7 @@ export function getOrganLabelAtPoint(pane: CinePane, clientX: number, clientY: n
         return undefined;
     }
 
-    const [i, j, k] = volume.imageData.worldToIndex(world).map((v) => Math.round(v));
+    const [i, j, k] = volume.imageData.worldToIndex(world).map((v: number) => Math.round(v));
     const [dimX, dimY, dimZ] = volume.voxelManager.dimensions;
     if (i < 0 || j < 0 || k < 0 || i >= dimX || j >= dimY || k >= dimZ) return undefined;
     const res = volume.voxelManager.getAtIJK(i, j, k);

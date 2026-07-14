@@ -119,7 +119,7 @@ function MaskEditPanel({ organs, caseId, serverCaseId, mode, onModeChange, onClo
 			const customLabels = getCustomSegmentLabelsForExport();
 			form.append(
 				"labels",
-				new Blob([JSON.stringify(customLabels)], {type: "applications/json"}),
+				new Blob([JSON.stringify(customLabels)], {type: "application/json"}),
 				"labels.json"
 			);
 

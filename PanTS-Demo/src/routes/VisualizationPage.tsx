@@ -86,7 +86,6 @@ import {
     ROI_TOOL,
     rotatePane90Clockwise,
     setActiveMaskEditTool,
-	restoreCustomSegmentLabels,
     setActiveMeasurementTool,
     setFillOpacity,
     setOutlineOpacity,
@@ -1039,7 +1038,8 @@ function VisualizationPage() {
 		axial_ref,
 		sagittal_ref,
 		coronal_ref,
-		// labelColorMap,
+		// labelColorMap intentionally excluded — creating a new class updates
+		// this map and would otherwise retrigger the CT/volume setup effect.
 	]);
 	// Toggle checkbox state
 	//   useEffect(() => {
