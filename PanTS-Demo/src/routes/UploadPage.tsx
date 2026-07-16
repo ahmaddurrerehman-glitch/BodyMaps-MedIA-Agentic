@@ -1,6 +1,7 @@
 import React, { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 
 const MODEL_OPTIONS: { id: string; label: string; desc: string }[] = [
+  { id: "None",      label: "None",       desc: "View only — files never leave your browser" },
   { id: "ePAI",      label: "ePAI",       desc: "For detailed pancreas and tumor analysis" },
   { id: "SuPreM",    label: "SuPreM",     desc: "For whole-body scans from lungs to legs" },
   { id: "MedFormer", label: "MedFormer",  desc: "For reliable abdominal segmentation" },
@@ -10,8 +11,10 @@ const MODEL_OPTIONS: { id: string; label: string; desc: string }[] = [
 import { useNavigate } from 'react-router-dom';
 import './UploadPage.css';
 
-// Lazy so NiiVue isn't pulled into the upload bundle until a file is actually previewed.
+// Lazy so NiiVue / Cornerstone aren't pulled into the upload bundle until a file
+// is actually previewed. CtPreview handles NIfTI, DicomPreview handles a DICOM series.
 const CtPreview = lazy(() => import('../components/CtPreview/CtPreview'));
+const DicomPreview = lazy(() => import('../components/CtPreview/DicomPreview'));
 import { API_BASE } from '../helpers/constants';
 import {
   addRecentUpload,
@@ -24,6 +27,7 @@ import {
 } from '../helpers/recentUploads';
 import Header from '../components/Header';
 import { looksLikeDicom, setLocalDicomFiles } from '../helpers/dicomLocal';
+import { setLocalNiftiFile } from '../helpers/localNifti';
 import {
   deletePendingUpload,
   loadPendingUploads,
@@ -44,10 +48,17 @@ const parseApiResponse = async (res: Response): Promise<any> => {
   );
 };
 
+// A selection is either a single NIfTI file or a picked DICOM folder (the series'
+// raw .dcm slices). Both are previewable individually and runnable through inference.
+type SelectedItem =
+  | { id: string; kind: 'nifti'; file: File }
+  | { id: string; kind: 'dicom'; files: File[]; label: string };
+
 const UploadPage: React.FC = () => {
   const navigate = useNavigate();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const dicomInputRef = useRef<HTMLInputElement | null>(null);
+  // Folder picker for a DICOM series (run inference, or view-only when model is "None").
+  const dicomUploadInputRef = useRef<HTMLInputElement | null>(null);
   // One poll timer per in-flight session so runs can proceed in parallel.
   const pollTimersRef = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
   // Whether the current foreground upload got stored in IndexedDB (resumable).
@@ -58,21 +69,9 @@ const UploadPage: React.FC = () => {
   // Which session currently drives the foreground upload progress bar.
   const foregroundUploadSidRef = useRef<string | null>(null);
 
-  // Local DICOM: stash the picked folder's files and open the viewer's /dicom
-  // route. Nothing is uploaded - the viewer reads the File objects directly.
-  const handleDicomFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []);
-    e.target.value = ""; // allow re-picking the same folder later
-    const candidates = files.filter(looksLikeDicom);
-    if (!candidates.length) {
-      alert("No DICOM files (.dcm) found in the selected folder.");
-      return;
-    }
-    setLocalDicomFiles(candidates);
-    navigate("/dicom");
-  };
-
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedItems, setSelectedItems] = useState<SelectedItem[]>([]);
+  // Which selected item's inline preview is open (null = none). One at a time.
+  const [previewItemId, setPreviewItemId] = useState<string | null>(null);
   const [message, setMessage] = useState<string>("");
   const [serverPath, setServerPath] = useState<string>("");
   const [sessionId, setSessionId] = useState<string>("");
@@ -80,7 +79,7 @@ const UploadPage: React.FC = () => {
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [inferenceCompleted, setInferenceCompleted] = useState<boolean>(false);
-  const [selectedModel, setSelectedModel] = useState<"ePAI" | "SuPreM" | "OpenVAE" | "MedFormer" | "R-Super" | "Atlas-Net" | "">("");
+  const [selectedModel, setSelectedModel] = useState<"None" | "ePAI" | "SuPreM" | "OpenVAE" | "MedFormer" | "R-Super" | "Atlas-Net" | "">("");
   const [modelDropOpen, setModelDropOpen] = useState(false);
   const modelDropRef = useRef<HTMLDivElement>(null);
   const [preDropOpen, setPreDropOpen] = useState(false);
@@ -117,7 +116,7 @@ const UploadPage: React.FC = () => {
       alert("Please select .nii or .nii.gz files only");
       return;
     }
-    setSelectedFiles(prev => [...prev, ...filteredFiles]);
+    setSelectedItems(prev => [...prev, ...filteredFiles.map(f => ({ id: crypto.randomUUID(), kind: 'nifti' as const, file: f }))]);
   };
 
   const handleDrop = useCallback((e: React.DragEvent) => {
@@ -131,7 +130,7 @@ const UploadPage: React.FC = () => {
       alert("Please drop .nii or .nii.gz files only");
       return;
     }
-    setSelectedFiles(prev => [...prev, ...filteredFiles]);
+    setSelectedItems(prev => [...prev, ...filteredFiles.map(f => ({ id: crypto.randomUUID(), kind: 'nifti' as const, file: f }))]);
   }, []);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -143,8 +142,25 @@ const UploadPage: React.FC = () => {
     setIsDragOver(false);
   }, []);
 
-  const removeFile = (index: number) => {
-    setSelectedFiles(prev => prev.filter((_, i) => i !== index));
+  const removeItem = (id: string) => {
+    setSelectedItems(prev => prev.filter(item => item.id !== id));
+    setPreviewItemId(prev => (prev === id ? null : prev));
+  };
+
+  // Pick a DICOM folder to RUN INFERENCE on (distinct from the view-only opener):
+  // the raw slices are added as one selectable item, previewable and runnable.
+  const handleDicomInferenceSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = ""; // allow re-picking the same folder later
+    const candidates = files.filter(looksLikeDicom);
+    if (!candidates.length) {
+      alert("No DICOM files (.dcm) found in the selected folder.");
+      return;
+    }
+    setSelectedItems(prev => [
+      ...prev,
+      { id: crypto.randomUUID(), kind: 'dicom', files: candidates, label: `DICOM series (${candidates.length} slices)` },
+    ]);
   };
 
   /* ── Inference polling (one timer per session) ── */
@@ -427,18 +443,108 @@ const UploadPage: React.FC = () => {
     }
   };
 
+  // DICOM folder → inference. Uploads each raw slice, asks the server to convert
+  // the series to NIfTI (SimpleITK), then hands off to the same inference + polling
+  // flow as a NIfTI run. Not IndexedDB-resumable (a folder is many files); a reload
+  // mid-upload marks the run Failed, consistent with the Active/Recent cards. Wired
+  // into uploadAbortRef so the Active card's Cancel button aborts it cleanly.
+  const runDicomUpload = async (sid: string, files: File[], model: string) => {
+    const controller = new AbortController();
+    uploadAbortRef.current.set(sid, controller);
+    foregroundUploadSidRef.current = sid;
+    uploadResumableRef.current = false; // no IDB copy for a DICOM folder
+    setPhase(sid, "uploading");
+    try {
+      setIsUploading(true);
+      setUploadProgress(0);
+      setMessage(`Uploading DICOM series (${files.length} slices)...`);
+
+      for (let i = 0; i < files.length; i++) {
+        const formData = new FormData();
+        formData.append("session_id", sid);
+        formData.append("file", files[i]);
+        const res = await fetch(`${API_BASE}/api/upload-dicom-slice`, {
+          method: "POST", body: formData, signal: controller.signal,
+        });
+        if (res.status === 413) throw new Error("DICOM slice too large for server/proxy limit (HTTP 413).");
+        const data = await parseApiResponse(res);
+        if (!res.ok) throw new Error(data.error || "DICOM slice upload failed");
+        setUploadProgress(Math.round(((i + 1) / files.length) * 100));
+      }
+
+      setMessage("Converting DICOM series to NIfTI...");
+      const finalizeRes = await fetch(`${API_BASE}/api/finalize-dicom`, {
+        method: "POST", signal: controller.signal,
+        body: new URLSearchParams({ session_id: sid }),
+      });
+      const finalizeData = await parseApiResponse(finalizeRes);
+      if (!finalizeRes.ok) throw new Error(finalizeData.error || "DICOM conversion failed");
+      const uploadedName = finalizeData.uploaded_filename || "ct.nii.gz";
+
+      foregroundUploadSidRef.current = null;
+      setUploadProgress(100);
+      setIsUploading(false);
+
+      setMessage(`Starting ${model} inference...`);
+      const inferFd = new FormData();
+      inferFd.append("session_id", sid);
+      inferFd.append("model_name", model);
+      inferFd.append("uploaded_filename", uploadedName);
+      const res = await fetch(`${API_BASE}/api/run-epai-inference`, {
+        method: "POST", body: inferFd, signal: controller.signal,
+      });
+      const data = await parseApiResponse(res);
+      if (!res.ok) throw new Error(data.error || "Failed to start inference");
+
+      setSessionId(sid);
+      setPhase(sid, "queued"); // server queues for the GPU; poll refines this
+      setMessage(`${model} inference started. Session: ${sid}`);
+      startInferencePolling(sid, model);
+    } catch (err) {
+      // A user cancel aborts our fetches - cancelRun already set the card to
+      // Cancelled, so don't overwrite that with Failed.
+      if (controller.signal.aborted) return;
+      console.error(err);
+      setPhase(sid);
+      foregroundUploadSidRef.current = null;
+      setIsUploading(false);
+      setRecentUploads(updateRecentUploadStatus(sid, "Failed"));
+      setMessage("Failed: " + (err as Error).message);
+    } finally {
+      if (uploadAbortRef.current.get(sid) === controller) {
+        uploadAbortRef.current.delete(sid);
+      }
+    }
+  };
+
   /* ── Run inference ── */
   const handleRunEpaiInference = async () => {
-    const file = selectedFiles[0] ?? null;
+    const item = selectedItems[0] ?? null;
+
+    // "None" model = view only: open the scan in its full local viewer, nothing is
+    // uploaded or run. DICOM opens the /dicom viewer, NIfTI the /local-nifti viewer.
+    if (selectedModel === "None") {
+      if (!item) { alert("Select a scan to view first."); return; }
+      if (item.kind === "dicom") {
+        setLocalDicomFiles(item.files);
+        navigate("/dicom");
+      } else {
+        setLocalNiftiFile(item.file);
+        navigate("/local-nifti");
+      }
+      return;
+    }
+
     const path = serverPath.trim();
-    if (!file && !path) {
+    if (!item && !path) {
       alert("Provide a server file path or upload/select a file first.");
       return;
     }
 
     const model = selectedModel;
     const sid = crypto.randomUUID();
-    const label = bdmapId.trim() || (path ? path.split("/").pop() : file?.name) || sid;
+    const itemName = item ? (item.kind === 'dicom' ? item.label : item.file.name) : undefined;
+    const label = bdmapId.trim() || (path ? path.split("/").pop() : itemName) || sid;
 
     setInferenceCompleted(false);
     setRecentUploads(
@@ -476,16 +582,24 @@ const UploadPage: React.FC = () => {
       return;
     }
 
-    // File upload: consume it so the next file can be queued, stash it in
-    // IndexedDB so an interrupted upload can resume, then run.
-    setSelectedFiles(prev => prev.slice(1));
+    // Consume the first item so the next can be queued. A DICOM folder uploads its
+    // slices and converts server-side; a NIfTI file rides the resumable path (stashed
+    // in IndexedDB so an interrupted upload can resume).
+    setSelectedItems(prev => prev.slice(1));
+
+    if (item!.kind === 'dicom') {
+      runDicomUpload(sid, item!.files, model);
+      return;
+    }
+
+    const file = item!.file;
     const pending: PendingUpload = {
       sessionId: sid,
-      file: file!,
-      filename: file!.name,
+      file,
+      filename: file.name,
       model,
       bdmapId: bdmapId.trim(),
-      totalChunks: Math.ceil(file!.size / CHUNK_SIZE),
+      totalChunks: Math.ceil(file.size / CHUNK_SIZE),
       nextChunk: 0,
     };
     uploadResumableRef.current = await savePendingUpload(pending);
@@ -601,6 +715,8 @@ const UploadPage: React.FC = () => {
   };
 
   /* ── Render ── */
+  const previewItem = selectedItems.find(i => i.id === previewItemId) ?? null;
+
   return (
     <div className="upload-page-wrapper">
       {/* Ambient glow */}
@@ -631,48 +747,78 @@ const UploadPage: React.FC = () => {
               style={{ display: 'none' }}
               onChange={handleFileSelect}
             />
+            <input
+              // Set the folder-picker attributes imperatively — passing webkitdirectory
+              // as a JSX/spread prop doesn't reliably apply it, so the picker falls back
+              // to single files. directory is the Firefox spelling.
+              ref={el => {
+                dicomUploadInputRef.current = el;
+                if (el) {
+                  el.setAttribute('webkitdirectory', '');
+                  el.setAttribute('directory', '');
+                }
+              }}
+              type="file"
+              multiple
+              style={{ display: 'none' }}
+              onChange={handleDicomInferenceSelect}
+            />
             <svg className="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
               <polyline points="17 8 12 3 7 8" />
               <line x1="12" y1="3" x2="12" y2="15" />
             </svg>
             <div className="dropzone-text">Click or drag to upload</div>
-            <div className="dropzone-sub">.nii or .nii.gz</div>
+            <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
+              <button
+                type="button"
+                className="dropzone-btn"
+                onClick={e => { e.stopPropagation(); fileInputRef.current?.click(); }}
+              >
+                Select NIfTI file
+              </button>
+              <button
+                type="button"
+                className="dropzone-btn"
+                onClick={e => { e.stopPropagation(); dicomUploadInputRef.current?.click(); }}
+              >
+                Select DICOM folder
+              </button>
+            </div>
           </div>
 
-          {/* ── Local DICOM: view a folder of .dcm slices in-browser, nothing uploaded ── */}
-          <input
-            ref={dicomInputRef}
-            type="file"
-            multiple
-            style={{ display: 'none' }}
-            // Non-standard folder picker (Chrome/Edge/Safari); TS doesn't know it.
-            {...({ webkitdirectory: '' } as React.InputHTMLAttributes<HTMLInputElement>)}
-            onChange={handleDicomFolderSelect}
-          />
-          <button className="dicom-open-link" onClick={() => dicomInputRef.current?.click()}>
-            …or open a local DICOM folder in the viewer
-            <span>view only - the files never leave your browser</span>
-          </button>
-
-          {/* ── File chips ── */}
-          {selectedFiles.length > 0 && (
+          {/* ── Selected items: NIfTI files + DICOM series, each individually previewable ── */}
+          {selectedItems.length > 0 && (
             <div className="file-chips">
-              {selectedFiles.map((file, index) => (
-                <div key={index} className="file-chip">
-                  {file.name}
-                  <button className="file-chip-remove" onClick={() => removeFile(index)}>×</button>
-                </div>
-              ))}
+              {selectedItems.map((item) => {
+                const name = item.kind === 'dicom' ? item.label : item.file.name;
+                const isOpen = previewItemId === item.id;
+                return (
+                  <div key={item.id} className={`file-chip${isOpen ? ' file-chip--active' : ''}`}>
+                    <span className="file-chip-name">{name}</span>
+                    <button
+                      className="file-chip-preview"
+                      onClick={() => setPreviewItemId(prev => (prev === item.id ? null : item.id))}
+                    >
+                      {isOpen ? 'Hide' : 'Preview'}
+                    </button>
+                    <button className="file-chip-remove" onClick={() => removeItem(item.id)}>×</button>
+                  </div>
+                );
+              })}
             </div>
           )}
 
           {/* ── Pre-inference preview: inspect the selected scan before running a model ── */}
-          {selectedFiles.length > 0 && !isUploading && (
+          {previewItem && !isUploading && (
             <>
-              <div className="ct-preview-label">Preview · {selectedFiles[0].name}</div>
+              <div className="ct-preview-label">
+                Preview · {previewItem.kind === 'dicom' ? previewItem.label : previewItem.file.name}
+              </div>
               <Suspense fallback={<div className="ct-preview ct-preview--msg">Loading preview…</div>}>
-                <CtPreview file={selectedFiles[0]} />
+                {previewItem.kind === 'dicom'
+                  ? <DicomPreview files={previewItem.files} />
+                  : <CtPreview file={previewItem.file} />}
               </Suspense>
             </>
           )}
@@ -825,7 +971,7 @@ const UploadPage: React.FC = () => {
               onClick={handleRunEpaiInference}
               disabled={!selectedModel || isUploading}
             >
-              Run
+              {selectedModel === "None" ? "View" : "Run"}
             </button>
           </div>
 
